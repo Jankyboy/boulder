@@ -64,13 +64,14 @@ func selectRegistration(s db.OneSelector, q string, args ...interface{}) (*regMo
 
 const certFields = "registrationID, serial, digest, der, issued, expires"
 
-// SelectCertificate selects all fields of one certificate object
-// identified by serial.
+// SelectCertificate selects all fields of one certificate object identified by
+// a serial. If more than one row contains the same serial only the first is
+// returned.
 func SelectCertificate(s db.OneSelector, serial string) (core.Certificate, error) {
 	var model core.Certificate
 	err := s.SelectOne(
 		&model,
-		"SELECT "+certFields+" FROM certificates WHERE serial = ?",
+		"SELECT "+certFields+" FROM certificates WHERE serial = ? LIMIT 1",
 		serial,
 	)
 	return model, err
@@ -179,11 +180,10 @@ type challModel struct {
 	Token            string             `db:"token"`
 	KeyAuthorization string             `db:"keyAuthorization"`
 	ValidationRecord []byte             `db:"validationRecord"`
+	AttemptedAt      time.Time          `db:"attemptedAt"`
 
 	// TODO(#1818): Remove, this field is unused, but is kept temporarily to avoid a database migration.
 	Validated bool `db:"validated"`
-
-	LockCol int64
 }
 
 // newReg creates a reg model object from a core.Registration
@@ -203,6 +203,11 @@ func registrationToModel(r *core.Registration) (*regModel, error) {
 	if r.Contact == nil {
 		r.Contact = &[]string{}
 	}
+	var createdAt time.Time
+	if r.CreatedAt != nil {
+		createdAt = *r.CreatedAt
+	}
+
 	rm := regModel{
 		ID:        r.ID,
 		Key:       key,
@@ -210,7 +215,7 @@ func registrationToModel(r *core.Registration) (*regModel, error) {
 		Contact:   *r.Contact,
 		Agreement: r.Agreement,
 		InitialIP: []byte(r.InitialIP.To16()),
-		CreatedAt: r.CreatedAt,
+		CreatedAt: createdAt,
 		Status:    string(r.Status),
 	}
 
@@ -242,7 +247,7 @@ func modelToRegistration(reg *regModel) (core.Registration, error) {
 		Contact:   contact,
 		Agreement: reg.Agreement,
 		InitialIP: net.IP(reg.InitialIP),
-		CreatedAt: reg.CreatedAt,
+		CreatedAt: &reg.CreatedAt,
 		Status:    core.AcmeStatus(reg.Status),
 	}
 
@@ -255,6 +260,7 @@ func modelToChallenge(cm *challModel) (core.Challenge, error) {
 		Status:                   cm.Status,
 		Token:                    cm.Token,
 		ProvidedKeyAuthorization: cm.KeyAuthorization,
+		Validated:                &cm.AttemptedAt,
 	}
 	if len(cm.Error) > 0 {
 		var problem probs.ProblemDetails
@@ -408,17 +414,18 @@ func statusUint(status core.AcmeStatus) uint8 {
 const authzFields = "id, identifierType, identifierValue, registrationID, status, expires, challenges, attempted, token, validationError, validationRecord"
 
 type authzModel struct {
-	ID               int64     `db:"id"`
-	IdentifierType   uint8     `db:"identifierType"`
-	IdentifierValue  string    `db:"identifierValue"`
-	RegistrationID   int64     `db:"registrationID"`
-	Status           uint8     `db:"status"`
-	Expires          time.Time `db:"expires"`
-	Challenges       uint8     `db:"challenges"`
-	Attempted        *uint8    `db:"attempted"`
-	Token            []byte    `db:"token"`
-	ValidationError  []byte    `db:"validationError"`
-	ValidationRecord []byte    `db:"validationRecord"`
+	ID               int64      `db:"id"`
+	IdentifierType   uint8      `db:"identifierType"`
+	IdentifierValue  string     `db:"identifierValue"`
+	RegistrationID   int64      `db:"registrationID"`
+	Status           uint8      `db:"status"`
+	Expires          time.Time  `db:"expires"`
+	Challenges       uint8      `db:"challenges"`
+	Attempted        *uint8     `db:"attempted"`
+	AttemptedAt      *time.Time `db:"attemptedAt"`
+	Token            []byte     `db:"token"`
+	ValidationError  []byte     `db:"validationError"`
+	ValidationRecord []byte     `db:"validationRecord"`
 }
 
 // hasMultipleNonPendingChallenges checks if a slice of challenges contains
@@ -479,6 +486,15 @@ func authzPBToModel(authz *corepb.Authorization) (*authzModel, error) {
 		if chall.Status == string(core.StatusValid) || chall.Status == string(core.StatusInvalid) {
 			attemptedType := challTypeToUint[chall.Type]
 			am.Attempted = &attemptedType
+
+			// If validated Unix timestamp is zero then keep the core.Challenge Validated object nil.
+			var validated *time.Time
+			if chall.Validated != 0 {
+				val := time.Unix(0, chall.Validated).UTC()
+				validated = &val
+			}
+			am.AttemptedAt = validated
+
 			// Marshal corepb.ValidationRecords to core.ValidationRecords so that we
 			// can marshal them to JSON.
 			records := make([]core.ValidationRecord, len(chall.Validationrecords))
@@ -590,6 +606,12 @@ func modelToAuthzPB(am authzModel) (*corepb.Authorization, error) {
 					if err := populateAttemptedFields(am, challenge); err != nil {
 						return nil, err
 					}
+					// Get the attemptedAt time and assign to the challenge validated time.
+					var validated int64
+					if am.AttemptedAt != nil {
+						validated = am.AttemptedAt.UTC().UnixNano()
+					}
+					challenge.Validated = validated
 					pb.Challenges = append(pb.Challenges, challenge)
 				}
 			} else {

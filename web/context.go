@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/letsencrypt/boulder/features"
+	"github.com/honeycombio/beeline-go"
 	blog "github.com/letsencrypt/boulder/log"
 )
 
@@ -58,8 +58,7 @@ func (e *RequestEvent) AddError(msg string, args ...interface{}) {
 type WFEHandlerFunc func(context.Context, *RequestEvent, http.ResponseWriter, *http.Request)
 
 func (f WFEHandlerFunc) ServeHTTP(e *RequestEvent, w http.ResponseWriter, r *http.Request) {
-	ctx := context.TODO()
-	f(ctx, e, w, r)
+	f(r.Context(), e, w, r)
 }
 
 type wfeHandler interface {
@@ -105,39 +104,45 @@ func (th *TopHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		Origin:    r.Header.Get("Origin"),
 		Extra:     make(map[string]interface{}),
 	}
+	ctx := r.Context()
+	beeline.AddFieldToTrace(ctx, "real_ip", logEvent.RealIP)
+	beeline.AddFieldToTrace(ctx, "method", logEvent.Method)
+	beeline.AddFieldToTrace(ctx, "user_agent", logEvent.UserAgent)
+	beeline.AddFieldToTrace(ctx, "origin", logEvent.Origin)
 
-	if features.Enabled(features.StripDefaultSchemePort) {
-		// Some clients will send a HTTP Host header that includes the default port
-		// for the scheme that they are using. Previously when we were fronted by
-		// Akamai they would rewrite the header and strip out the unnecessary port,
-		// now that they are not in our request path we need to strip these ports out
-		// ourselves.
-		//
-		// The main reason we want to strip these ports out is so that when this header
-		// is sent to the /directory endpoint we don't reply with directory URLs that
-		// also contain these ports, which would then in turn end up being sent in the JWS
-		// signature 'url' header, which we don't support.
-		//
-		// We unconditionally strip :443 even when r.TLS is nil because the WFE/WFE2
-		// may be deployed HTTP-only behind another service that terminates HTTPS on
-		// its behalf.
-		if strings.HasSuffix(r.Host, ":443") {
-			r.Host = strings.TrimSuffix(r.Host, ":443")
-		} else if strings.HasSuffix(r.Host, ":80") {
-			r.Host = strings.TrimSuffix(r.Host, ":80")
-		}
+	// Some clients will send a HTTP Host header that includes the default port
+	// for the scheme that they are using. Previously when we were fronted by
+	// Akamai they would rewrite the header and strip out the unnecessary port,
+	// now that they are not in our request path we need to strip these ports out
+	// ourselves.
+	//
+	// The main reason we want to strip these ports out is so that when this header
+	// is sent to the /directory endpoint we don't reply with directory URLs that
+	// also contain these ports, which would then in turn end up being sent in the JWS
+	// signature 'url' header, which we don't support.
+	//
+	// We unconditionally strip :443 even when r.TLS is nil because the WFE/WFE2
+	// may be deployed HTTP-only behind another service that terminates HTTPS on
+	// its behalf.
+	if strings.HasSuffix(r.Host, ":443") {
+		r.Host = strings.TrimSuffix(r.Host, ":443")
+	} else if strings.HasSuffix(r.Host, ":80") {
+		r.Host = strings.TrimSuffix(r.Host, ":80")
 	}
 
 	begin := time.Now()
 	rwws := &responseWriterWithStatus{w, 0}
 	defer func() {
+		beeline.AddFieldToTrace(ctx, "internal_errors", logEvent.InternalErrors)
 		logEvent.Code = rwws.code
 		if logEvent.Code == 0 {
 			// If we haven't explicitly set a status code golang will set it
 			// to 200 itself when writing to the wire
 			logEvent.Code = http.StatusOK
 		}
+		beeline.AddFieldToTrace(ctx, "code", logEvent.Code)
 		logEvent.Latency = time.Since(begin).Seconds()
+		beeline.AddFieldToTrace(ctx, "latency", logEvent.Latency)
 		th.logEvent(logEvent)
 	}()
 	th.wfe.ServeHTTP(logEvent, rwws, r)

@@ -1,7 +1,9 @@
 {
     "BadKeyRevoker": {
-        "dbConnectFile": "test/secrets/badkeyrevoker_dburl",
-        "maxDBConns": 10,
+        "db": {
+            "dbConnectFile": "test/secrets/badkeyrevoker_dburl",
+            "maxOpenConns": 10
+        },
         "debugAddr": ":8020",
         "tls": {
             "caCertFile": "test/grpc-creds/minica.pem",
@@ -27,7 +29,11 @@
         "interval": "1s"
     },
     "syslog": {
-        "stdoutlevel": 6,
+        "stdoutlevel": 4,
         "sysloglevel": 4
+    },
+    "beeline": {
+        "mute": true,
+        "dataset": "Test"
     }
 }

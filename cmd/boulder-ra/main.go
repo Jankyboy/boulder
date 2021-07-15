@@ -1,21 +1,24 @@
 package main
 
 import (
-	"crypto/x509"
 	"flag"
 	"fmt"
 	"os"
 	"time"
 
+	"google.golang.org/grpc/health"
+	healthpb "google.golang.org/grpc/health/grpc_health_v1"
+
+	"github.com/honeycombio/beeline-go"
 	akamaipb "github.com/letsencrypt/boulder/akamai/proto"
 	capb "github.com/letsencrypt/boulder/ca/proto"
 	"github.com/letsencrypt/boulder/cmd"
-	"github.com/letsencrypt/boulder/core"
 	"github.com/letsencrypt/boulder/ctpolicy"
 	"github.com/letsencrypt/boulder/ctpolicy/ctconfig"
 	"github.com/letsencrypt/boulder/features"
 	"github.com/letsencrypt/boulder/goodkey"
 	bgrpc "github.com/letsencrypt/boulder/grpc"
+	"github.com/letsencrypt/boulder/issuance"
 	"github.com/letsencrypt/boulder/policy"
 	pubpb "github.com/letsencrypt/boulder/publisher/proto"
 	"github.com/letsencrypt/boulder/ra"
@@ -84,14 +87,20 @@ type config struct {
 
 		// IssuerCertPath is the path to the intermediate used to issue certificates.
 		// It is used to generate OCSP URLs to purge at revocation time.
+		// TODO(#5162): DEPRECATED. Remove this field entirely.
 		IssuerCertPath string
+		// IssuerCerts are paths to all intermediate certificates which may have
+		// been used to issue certificates in the last 90 days. These are used to
+		// generate OCSP URLs to purge during revocation.
+		IssuerCerts []string
 
 		Features map[string]bool
 	}
 
 	PA cmd.PAConfig
 
-	Syslog cmd.SyslogConfig
+	Syslog  cmd.SyslogConfig
+	Beeline cmd.BeelineConfig
 }
 
 func main() {
@@ -118,6 +127,11 @@ func main() {
 		c.RA.DebugAddr = *debugAddr
 	}
 
+	bc, err := c.Beeline.Load()
+	cmd.FailOnError(err, "Failed to load Beeline config")
+	beeline.Init(bc)
+	defer beeline.Close()
+
 	scope, logger := cmd.StatsAndLogging(c.Syslog, c.RA.DebugAddr)
 	defer logger.AuditPanic()
 	logger.Info(cmd.VersionString())
@@ -142,27 +156,31 @@ func main() {
 	clientMetrics := bgrpc.NewClientMetrics(scope)
 	vaConn, err := bgrpc.ClientSetup(c.RA.VAService, tlsConfig, clientMetrics, clk)
 	cmd.FailOnError(err, "Unable to create VA client")
-	vac := bgrpc.NewValidationAuthorityGRPCClient(vaConn)
-
+	vac := vapb.NewVAClient(vaConn)
 	caaClient := vapb.NewCAAClient(vaConn)
 
 	caConn, err := bgrpc.ClientSetup(c.RA.CAService, tlsConfig, clientMetrics, clk)
 	cmd.FailOnError(err, "Unable to create CA client")
-	cac := bgrpc.NewCertificateAuthorityClient(capb.NewCertificateAuthorityClient(caConn))
+	cac := capb.NewCertificateAuthorityClient(caConn)
 
 	var ctp *ctpolicy.CTPolicy
 	conn, err := bgrpc.ClientSetup(c.RA.PublisherService, tlsConfig, clientMetrics, clk)
 	cmd.FailOnError(err, "Failed to load credentials and create gRPC connection to Publisher")
-	pubc := bgrpc.NewPublisherClientWrapper(pubpb.NewPublisherClient(conn))
+	pubc := pubpb.NewPublisherClient(conn)
 
-	var apc akamaipb.AkamaiPurgerClient
-	var issuerCert *x509.Certificate
 	apConn, err := bgrpc.ClientSetup(c.RA.AkamaiPurgerService, tlsConfig, clientMetrics, clk)
 	cmd.FailOnError(err, "Unable to create a Akamai Purger client")
-	apc = akamaipb.NewAkamaiPurgerClient(apConn)
+	apc := akamaipb.NewAkamaiPurgerClient(apConn)
 
-	issuerCert, err = core.LoadCert(c.RA.IssuerCertPath)
-	cmd.FailOnError(err, "Failed to load issuer certificate")
+	issuerCertPaths := c.RA.IssuerCerts
+	if len(issuerCertPaths) == 0 {
+		issuerCertPaths = []string{c.RA.IssuerCertPath}
+	}
+	issuerCerts := make([]*issuance.Certificate, len(issuerCertPaths))
+	for i, issuerCertPath := range issuerCertPaths {
+		issuerCerts[i], err = issuance.LoadCertificate(issuerCertPath)
+		cmd.FailOnError(err, "Failed to load issuer certificate")
+	}
 
 	// Boulder's components assume that there will always be CT logs configured.
 	// Issuing a certificate without SCTs embedded is a miss-issuance event in the
@@ -225,7 +243,7 @@ func main() {
 		c.RA.OrderLifetime.Duration,
 		ctp,
 		apc,
-		issuerCert,
+		issuerCerts,
 	)
 
 	policyErr := rai.SetRateLimitPoliciesFile(c.RA.RateLimitPoliciesFilename)
@@ -241,8 +259,13 @@ func main() {
 	cmd.FailOnError(err, "Unable to setup RA gRPC server")
 	gw := bgrpc.NewRegistrationAuthorityServer(rai)
 	rapb.RegisterRegistrationAuthorityServer(grpcSrv, gw)
+	hs := health.NewServer()
+	healthpb.RegisterHealthServer(grpcSrv, hs)
 
-	go cmd.CatchSignals(logger, grpcSrv.GracefulStop)
+	go cmd.CatchSignals(logger, func() {
+		hs.Shutdown()
+		grpcSrv.GracefulStop()
+	})
 
 	err = cmd.FilterShutdownErrors(grpcSrv.Serve(listener))
 	cmd.FailOnError(err, "RA gRPC service failed")

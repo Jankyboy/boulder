@@ -1,7 +1,6 @@
 # Boulder - An ACME CA
 
-[![Build Status](https://travis-ci.com/letsencrypt/boulder.svg?branch=main)](https://travis-ci.com/letsencrypt/boulder)
-[![Coverage Status](https://coveralls.io/repos/github/letsencrypt/boulder/badge.svg?branch=main)](https://coveralls.io/github/letsencrypt/boulder?branch=main)
+[![Build Status](https://github.com/letsencrypt/boulder/actions/workflows/boulder-ci.yml/badge.svg?branch=main)](https://github.com/letsencrypt/boulder/actions/workflows/boulder-ci.yml?query=branch%3Amain)
 
 This is an implementation of an ACME-based CA. The [ACME
 protocol](https://github.com/ietf-wg-acme/acme/) allows the CA to
@@ -128,16 +127,40 @@ To start Boulder in a Docker container, run:
 docker-compose up
 ```
 
-To run tests:
+To run our standard battery of tests (lints, unit, integration):
 
 ```shell
 docker-compose run --use-aliases boulder ./test.sh
 ```
 
-To run a specific unittest:
+To run all unit tests:
 
 ```shell
-docker-compose run --use-aliases boulder go test ./ra
+docker-compose run --use-aliases boulder ./test.sh --unit
+```
+
+To run specific unit tests (example is of the ./va directory):
+
+```shell
+docker-compose run --use-aliases boulder ./test.sh --unit --filter=./va
+```
+
+To run all integration tests:
+
+```shell
+docker-compose run --use-aliases boulder ./test.sh --integration
+```
+
+To run specific integration tests (example runs TestAkamaiPurgerDrainQueueFails and TestWFECORS):
+
+```shell
+docker-compose run --use-aliases boulder ./test.sh --filter TestAkamaiPurgerDrainQueueFails/TestWFECORS
+```
+
+To get a list of available integration tests:
+
+```shell
+docker-compose run --use-aliases boulder ./test.sh --list-integration-tests
 ```
 
 The configuration in docker-compose.yml mounts your `$GOPATH` on top of its
@@ -173,6 +196,26 @@ address found in the command above)
 
 ```shell
 docker-compose run --use-aliases -e FAKE_DNS=172.17.0.1 --service-ports boulder ./start.py
+```
+
+Running tests without the `./test.sh` wrapper:
+
+Run all unit tests
+
+```shell
+docker-compose run --use-aliases boulder go test -p 1 ./...
+```
+
+Run unit tests for a specific directory:
+
+```shell
+docker-compose run --use-aliases boulder go test <DIRECTORY>
+```
+
+Run integration tests (omit `--filter <REGEX>` to run all):
+
+```shell
+docker-compose run --use-aliases boulder python3 test/integration-test.py --chisel --gotest --filter <REGEX>
 ```
 
 Boulder's default VA configuration (`test/config/va.json`) is configured to

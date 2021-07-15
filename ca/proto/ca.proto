@@ -24,6 +24,7 @@ message IssueCertificateRequest {
   bytes csr = 1;
   int64 registrationID = 2;
   int64 orderID = 3;
+  int64 issuerNameID = 4;
 }
 
 message IssuePrecertificateResponse {
@@ -39,11 +40,11 @@ message IssueCertificateForPrecertificateRequest {
 
 // Exactly one of certDER or [serial and issuerID] must be set.
 message GenerateOCSPRequest {
-  bytes certDER = 1;
   string status = 2;
   int32 reason = 3;
   int64 revokedAt = 4;
   string serial = 5;
+  // TODO(#5152): Replace issuerID with issuerNameID.
   int64 issuerID = 6;
 }
 

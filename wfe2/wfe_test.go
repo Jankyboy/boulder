@@ -25,6 +25,8 @@ import (
 	"time"
 
 	"github.com/jmhodges/clock"
+	"github.com/prometheus/client_golang/prometheus"
+	"google.golang.org/protobuf/types/known/emptypb"
 	jose "gopkg.in/square/go-jose.v2"
 
 	"github.com/letsencrypt/boulder/core"
@@ -33,6 +35,7 @@ import (
 	"github.com/letsencrypt/boulder/features"
 	"github.com/letsencrypt/boulder/goodkey"
 	"github.com/letsencrypt/boulder/identifier"
+	"github.com/letsencrypt/boulder/issuance"
 	blog "github.com/letsencrypt/boulder/log"
 	"github.com/letsencrypt/boulder/metrics"
 	"github.com/letsencrypt/boulder/mocks"
@@ -40,6 +43,7 @@ import (
 	"github.com/letsencrypt/boulder/probs"
 	rapb "github.com/letsencrypt/boulder/ra/proto"
 	"github.com/letsencrypt/boulder/revocation"
+	sapb "github.com/letsencrypt/boulder/sa/proto"
 	"github.com/letsencrypt/boulder/test"
 	"github.com/letsencrypt/boulder/web"
 )
@@ -205,8 +209,9 @@ type MockRegistrationAuthority struct {
 	lastRevocationReason revocation.Reason
 }
 
-func (ra *MockRegistrationAuthority) NewRegistration(ctx context.Context, acct core.Registration) (core.Registration, error) {
-	acct.ID = 1
+func (ra *MockRegistrationAuthority) NewRegistration(ctx context.Context, acct *corepb.Registration) (*corepb.Registration, error) {
+	acct.Id = 1
+	acct.CreatedAt = time.Date(2021, 1, 1, 0, 0, 0, 0, time.UTC).UnixNano()
 	return acct, nil
 }
 
@@ -216,25 +221,24 @@ func (ra *MockRegistrationAuthority) NewAuthorization(ctx context.Context, authz
 	return authz, nil
 }
 
-func (ra *MockRegistrationAuthority) NewCertificate(ctx context.Context, req core.CertificateRequest, acctID int64) (core.Certificate, error) {
+func (ra *MockRegistrationAuthority) NewCertificate(ctx context.Context, req core.CertificateRequest, acctID int64, issuerNameID int64) (core.Certificate, error) {
 	return core.Certificate{}, nil
 }
 
-func (ra *MockRegistrationAuthority) UpdateRegistration(ctx context.Context, acct core.Registration, updated core.Registration) (core.Registration, error) {
-	keysMatch, _ := core.PublicKeysEqual(acct.Key.Key, updated.Key.Key)
-	if !keysMatch {
-		acct.Key = updated.Key
+func (ra *MockRegistrationAuthority) UpdateRegistration(ctx context.Context, req *rapb.UpdateRegistrationRequest) (*corepb.Registration, error) {
+	if !bytes.Equal(req.Base.Key, req.Update.Key) {
+		req.Base.Key = req.Update.Key
 	}
-	return acct, nil
+	return req.Base, nil
 }
 
 func (ra *MockRegistrationAuthority) PerformValidation(_ context.Context, _ *rapb.PerformValidationRequest) (*corepb.Authorization, error) {
 	return nil, nil
 }
 
-func (ra *MockRegistrationAuthority) RevokeCertificateWithReg(ctx context.Context, cert x509.Certificate, reason revocation.Reason, reg int64) error {
-	ra.lastRevocationReason = reason
-	return nil
+func (ra *MockRegistrationAuthority) RevokeCertificateWithReg(ctx context.Context, req *rapb.RevokeCertificateWithRegRequest) (*emptypb.Empty, error) {
+	ra.lastRevocationReason = revocation.Reason(req.Code)
+	return &emptypb.Empty{}, nil
 }
 
 func (ra *MockRegistrationAuthority) AdministrativelyRevokeCertificate(ctx context.Context, cert x509.Certificate, reason revocation.Reason, user string) error {
@@ -249,15 +253,16 @@ func (ra *MockRegistrationAuthority) DeactivateAuthorization(ctx context.Context
 	return nil
 }
 
-func (ra *MockRegistrationAuthority) DeactivateRegistration(ctx context.Context, _ core.Registration) error {
-	return nil
+func (ra *MockRegistrationAuthority) DeactivateRegistration(ctx context.Context, _ *corepb.Registration) (*emptypb.Empty, error) {
+	return &emptypb.Empty{}, nil
 }
 
 func (ra *MockRegistrationAuthority) NewOrder(ctx context.Context, req *rapb.NewOrderRequest) (*corepb.Order, error) {
 	return &corepb.Order{
 		Id:               1,
 		RegistrationID:   req.RegistrationID,
-		Expires:          0,
+		Created:          time.Date(2021, 1, 1, 1, 1, 1, 0, time.UTC).UnixNano(),
+		Expires:          time.Date(2021, 2, 1, 1, 1, 1, 0, time.UTC).UnixNano(),
 		Names:            req.Names,
 		Status:           string(core.StatusPending),
 		V2Authorizations: []int64{1},
@@ -325,23 +330,38 @@ func setupWFE(t *testing.T) (WebFrontEndImpl, clock.FakeClock) {
 	fc := clock.NewFake()
 	stats := metrics.NoopRegisterer
 
-	chainPEM, err := ioutil.ReadFile("../test/test-ca2.pem")
-	test.AssertNotError(t, err, "Unable to read ../test/test-ca2.pem")
-	chainDER, _ := pem.Decode(chainPEM)
-
-	chainCrossPEM, err := ioutil.ReadFile("../test/test-ca2-cross.pem")
-	test.AssertNotError(t, err, "Unable to read ../test/test-ca2-cross.pem")
-
-	certChains := map[string][][]byte{
-		"http://localhost:4000/acme/issuer-cert": {
-			append([]byte{'\n'}, chainPEM...),
-			append([]byte{'\n'}, chainCrossPEM...),
+	certChains := map[issuance.IssuerNameID][][]byte{}
+	issuerCertificates := map[issuance.IssuerNameID]*issuance.Certificate{}
+	for _, files := range [][]string{
+		{
+			"../test/hierarchy/int-r3.cert.pem",
+			"../test/hierarchy/root-x1.cert.pem",
 		},
-	}
-	issuerCert, err := x509.ParseCertificate(chainDER.Bytes)
-	test.AssertNotError(t, err, "Unable to parse issuer cert")
-	issuerCertificates := []*x509.Certificate{
-		issuerCert,
+		{
+			"../test/hierarchy/int-r3-cross.cert.pem",
+			"../test/hierarchy/root-dst.cert.pem",
+		},
+		{
+			"../test/hierarchy/int-e1.cert.pem",
+			"../test/hierarchy/root-x2.cert.pem",
+		},
+		{
+			"../test/hierarchy/int-e1.cert.pem",
+			"../test/hierarchy/root-x2-cross.cert.pem",
+			"../test/hierarchy/root-x1-cross.cert.pem",
+			"../test/hierarchy/root-dst.cert.pem",
+		},
+	} {
+		certs, err := issuance.LoadChain(files)
+		test.AssertNotError(t, err, "Unable to load chain")
+		var buf bytes.Buffer
+		for _, cert := range certs {
+			buf.Write([]byte("\n"))
+			buf.Write(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: cert.Raw}))
+		}
+		id := certs[0].NameID()
+		certChains[id] = append(certChains[id], buf.Bytes())
+		issuerCertificates[id] = certs[0]
 	}
 
 	wfe, err := NewWebFrontEndImpl(stats, fc, testKeyPolicy, certChains, issuerCertificates, nil, nil, blog.NewMock(), 10*time.Second, 30*24*time.Hour, 7*24*time.Hour)
@@ -968,11 +988,6 @@ func TestHTTPMethods(t *testing.T) {
 			Allowed: postOnly,
 		},
 		{
-			Name:    "Issuer path should be GET only",
-			Path:    issuerPath,
-			Allowed: getOnly,
-		},
-		{
 			Name:    "Build ID path should be GET only",
 			Path:    buildIDPath,
 			Allowed: getOnly,
@@ -1295,7 +1310,6 @@ func TestNewECDSAAccount(t *testing.T) {
 			"y": "S8rR-0dWa8nAcw1fbunF_ajS3PQZ-QwLps-2adgLgPk"
 		},
 		"initialIp": "",
-		"createdAt": "0001-01-01T00:00:00Z",
 		"status": ""
 		}`)
 	test.AssertEquals(t, responseWriter.Header().Get("Location"), "http://localhost/acme/acct/3")
@@ -1477,7 +1491,6 @@ func TestNewAccount(t *testing.T) {
 			"mailto:person@mail.com"
 		],
 		"initialIp": "",
-		"createdAt": "0001-01-01T00:00:00Z",
 		"status": "valid"
 	}`)
 }
@@ -1526,7 +1539,7 @@ func TestNewAccountNoID(t *testing.T) {
 			"mailto:person@mail.com"
 		],
 		"initialIp": "1.1.1.1",
-		"createdAt": "0001-01-01T00:00:00Z",
+		"createdAt": "2021-01-01T00:00:00Z",
 		"status": ""
 	}`)
 }
@@ -1742,21 +1755,48 @@ func TestAccount(t *testing.T) {
 	}`)
 }
 
-func TestIssuer(t *testing.T) {
-	wfe, _ := setupWFE(t)
-	wfe.IssuerCert = []byte{0, 0, 1}
+type mockSAWithCert struct {
+	core.StorageGetter
+	cert   *x509.Certificate
+	status core.OCSPStatus
+}
 
-	responseWriter := httptest.NewRecorder()
+func newMockSAWithCert(t *testing.T, sa core.StorageGetter, status core.OCSPStatus) *mockSAWithCert {
+	cert, err := core.LoadCert("../test/hierarchy/ee-r3.cert.pem")
+	test.AssertNotError(t, err, "Failed to load test cert")
+	return &mockSAWithCert{sa, cert, status}
+}
 
-	wfe.Issuer(ctx, newRequestEvent(), responseWriter, &http.Request{
-		Method: "GET",
-	})
-	test.AssertEquals(t, responseWriter.Code, http.StatusOK)
-	test.Assert(t, bytes.Compare(responseWriter.Body.Bytes(), wfe.IssuerCert) == 0, "Incorrect bytes returned")
+// GetCertificate returns the mock SA's hard-coded certificate, issued by the
+// account with regID 1, if the given serial matches. Otherwise, returns not found.
+func (sa *mockSAWithCert) GetCertificate(_ context.Context, serial string) (core.Certificate, error) {
+	if serial != core.SerialToString(sa.cert.SerialNumber) {
+		return core.Certificate{}, berrors.NotFoundError("Certificate with serial %q not found", serial)
+	}
+
+	return core.Certificate{
+		RegistrationID: 1,
+		Serial:         core.SerialToString(sa.cert.SerialNumber),
+		DER:            sa.cert.Raw,
+	}, nil
+}
+
+// GetCertificateStatus returns the mock SA's status, if the given serial matches.
+// Otherwise, returns not found.
+func (sa *mockSAWithCert) GetCertificateStatus(_ context.Context, serial string) (core.CertificateStatus, error) {
+	if serial != core.SerialToString(sa.cert.SerialNumber) {
+		return core.CertificateStatus{}, berrors.NotFoundError("Status for certificate with serial %q not found", serial)
+	}
+
+	return core.CertificateStatus{
+		Serial: core.SerialToString(sa.cert.SerialNumber),
+		Status: sa.status,
+	}, nil
 }
 
 func TestGetCertificate(t *testing.T) {
 	wfe, _ := setupWFE(t)
+	wfe.SA = newMockSAWithCert(t, wfe.SA, core.OCSPStatusGood)
 	mux := wfe.Handler(metrics.NoopRegisterer)
 
 	makeGet := func(path string) *http.Request {
@@ -1772,19 +1812,19 @@ func TestGetCertificate(t *testing.T) {
 	_, ok := altKey.(*rsa.PrivateKey)
 	test.Assert(t, ok, "Couldn't load RSA key")
 
-	certPemBytes, _ := ioutil.ReadFile("test/178.crt")
+	certPemBytes, _ := ioutil.ReadFile("../test/hierarchy/ee-r3.cert.pem")
+	cert, err := core.LoadCert("../test/hierarchy/ee-r3.cert.pem")
+	test.AssertNotError(t, err, "failed to load test certificate")
+
+	chainPemBytes, err := ioutil.ReadFile("../test/hierarchy/int-r3.cert.pem")
+	test.AssertNotError(t, err, "Error reading ../test/hierarchy/int-r3.cert.pem")
+
+	chainCrossPemBytes, err := ioutil.ReadFile("../test/hierarchy/int-r3-cross.cert.pem")
+	test.AssertNotError(t, err, "Error reading ../test/hierarchy/int-r3-cross.cert.pem")
+
+	reqPath := fmt.Sprintf("/acme/cert/%s", core.SerialToString(cert.SerialNumber))
 	pkixContent := "application/pem-certificate-chain"
-
-	chainPemBytes, err := ioutil.ReadFile("../test/test-ca2.pem")
-	test.AssertNotError(t, err, "Error reading ../test/test-ca2.pem")
-
-	chainCrossPemBytes, err := ioutil.ReadFile("../test/test-ca2-cross.pem")
-	test.AssertNotError(t, err, "Error reading ../test/test-ca2-cross.pem")
-
 	noCache := "public, max-age=0, no-cache"
-	newSerial := "/acme/cert/0000000000000000000000000000000000b3"
-	newGetSerial := "/get/cert/0000000000000000000000000000000000b3"
-	goodSerial := "/acme/cert/0000000000000000000000000000000000b2"
 	notFound := `{"type":"` + probs.V2ErrorNS + `malformed","detail":"Certificate not found","status":404}`
 
 	testCases := []struct {
@@ -1799,17 +1839,17 @@ func TestGetCertificate(t *testing.T) {
 	}{
 		{
 			Name:           "Valid serial",
-			Request:        makeGet(goodSerial),
+			Request:        makeGet(reqPath),
 			ExpectedStatus: http.StatusOK,
 			ExpectedHeaders: map[string]string{
 				"Content-Type": pkixContent,
 			},
 			ExpectedCert: append(certPemBytes, append([]byte("\n"), chainPemBytes...)...),
-			ExpectedLink: fmt.Sprintf(`<http://localhost%s/1>;rel="alternate"`, goodSerial),
+			ExpectedLink: fmt.Sprintf(`<http://localhost%s/1>;rel="alternate"`, reqPath),
 		},
 		{
 			Name:           "Valid serial, POST-as-GET",
-			Request:        makePost(1, nil, goodSerial, ""),
+			Request:        makePost(1, nil, reqPath, ""),
 			ExpectedStatus: http.StatusOK,
 			ExpectedHeaders: map[string]string{
 				"Content-Type": pkixContent,
@@ -1818,7 +1858,7 @@ func TestGetCertificate(t *testing.T) {
 		},
 		{
 			Name:           "Valid serial, bad POST-as-GET",
-			Request:        makePost(1, nil, goodSerial, "{}"),
+			Request:        makePost(1, nil, reqPath, "{}"),
 			ExpectedStatus: http.StatusBadRequest,
 			ExpectedBody: `{
 				"type": "urn:ietf:params:acme:error:malformed",
@@ -1828,7 +1868,7 @@ func TestGetCertificate(t *testing.T) {
 		},
 		{
 			Name:           "Valid serial, POST-as-GET from wrong account",
-			Request:        makePost(2, altKey, goodSerial, ""),
+			Request:        makePost(2, altKey, reqPath, ""),
 			ExpectedStatus: http.StatusForbidden,
 			ExpectedBody: `{
 				"type": "urn:ietf:params:acme:error:unauthorized",
@@ -1838,19 +1878,9 @@ func TestGetCertificate(t *testing.T) {
 		},
 		{
 			Name:           "Unused serial, no cache",
-			Request:        makeGet("/acme/cert/0000000000000000000000000000000000ff"),
+			Request:        makeGet("/acme/cert/000000000000000000000000000000000001"),
 			ExpectedStatus: http.StatusNotFound,
 			ExpectedBody:   notFound,
-		},
-		{
-			Name:           "Internal server error, no cache",
-			Request:        makeGet("/acme/cert/000000000000000000000000000000626164"),
-			ExpectedStatus: http.StatusInternalServerError,
-			ExpectedBody: `{
-				"type": "urn:ietf:params:acme:error:serverInternal",
-				"status": 500,
-				"detail": "Failed to retrieve certificate"
-			}`,
 		},
 		{
 			Name:           "Invalid serial, no cache",
@@ -1865,62 +1895,34 @@ func TestGetCertificate(t *testing.T) {
 			ExpectedBody:   notFound,
 		},
 		{
-			Name:           "New cert",
-			Request:        makeGet(newGetSerial),
-			ExpectedStatus: http.StatusForbidden,
-			ExpectedBody: `{
-				"type": "` + probs.V2ErrorNS + `unauthorized",
-				"detail": "Certificate is too new for GET API. You should only use this non-standard API to access resources created more than 10s ago",
-				"status": 403
-			}`,
-		},
-		{
-			Name:           "New cert, old endpoint",
-			Request:        makeGet(newSerial),
-			ExpectedStatus: http.StatusOK,
-			ExpectedHeaders: map[string]string{
-				"Content-Type": pkixContent,
-			},
-			AnyCert: true,
-		},
-		{
-			Name:           "New cert, POST-as-GET",
-			Request:        makePost(1, nil, newSerial, ""),
-			ExpectedStatus: http.StatusOK,
-			ExpectedHeaders: map[string]string{
-				"Content-Type": pkixContent,
-			},
-			AnyCert: true,
-		},
-		{
 			Name:           "Valid serial (explicit default chain)",
-			Request:        makeGet(goodSerial + "/0"),
+			Request:        makeGet(reqPath + "/0"),
 			ExpectedStatus: http.StatusOK,
 			ExpectedHeaders: map[string]string{
 				"Content-Type": pkixContent,
 			},
-			ExpectedLink: fmt.Sprintf(`<http://localhost%s/1>;rel="alternate"`, goodSerial),
+			ExpectedLink: fmt.Sprintf(`<http://localhost%s/1>;rel="alternate"`, reqPath),
 			ExpectedCert: append(certPemBytes, append([]byte("\n"), chainPemBytes...)...),
 		},
 		{
 			Name:           "Valid serial (explicit alternate chain)",
-			Request:        makeGet(goodSerial + "/1"),
+			Request:        makeGet(reqPath + "/1"),
 			ExpectedStatus: http.StatusOK,
 			ExpectedHeaders: map[string]string{
 				"Content-Type": pkixContent,
 			},
-			ExpectedLink: fmt.Sprintf(`<http://localhost%s/0>;rel="alternate"`, goodSerial),
+			ExpectedLink: fmt.Sprintf(`<http://localhost%s/0>;rel="alternate"`, reqPath),
 			ExpectedCert: append(certPemBytes, append([]byte("\n"), chainCrossPemBytes...)...),
 		},
 		{
 			Name:           "Valid serial (explicit non-existent alternate chain)",
-			Request:        makeGet(goodSerial + "/2"),
+			Request:        makeGet(reqPath + "/2"),
 			ExpectedStatus: http.StatusNotFound,
 			ExpectedBody:   `{"type":"` + probs.V2ErrorNS + `malformed","detail":"Unknown issuance chain","status":404}`,
 		},
 		{
 			Name:           "Valid serial (explicit negative alternate chain)",
-			Request:        makeGet(goodSerial + "/-1"),
+			Request:        makeGet(reqPath + "/-1"),
 			ExpectedStatus: http.StatusBadRequest,
 			ExpectedBody:   `{"type":"` + probs.V2ErrorNS + `malformed","detail":"Chain ID must be a non-negative integer","status":400}`,
 		},
@@ -1993,14 +1995,165 @@ func TestGetCertificate(t *testing.T) {
 	}
 }
 
+type mockSAWithNewCert struct {
+	core.StorageGetter
+	clk clock.Clock
+}
+
+func (sa *mockSAWithNewCert) GetCertificate(_ context.Context, serial string) (core.Certificate, error) {
+	issuer, err := core.LoadCert("../test/hierarchy/int-e1.cert.pem")
+	if err != nil {
+		return core.Certificate{}, fmt.Errorf("failed to load test issuer cert: %w", err)
+	}
+
+	issuerKeyPem, err := ioutil.ReadFile("../test/hierarchy/int-e1.key.pem")
+	if err != nil {
+		return core.Certificate{}, fmt.Errorf("failed to load test issuer key: %w", err)
+	}
+	issuerKey := loadKey(&testing.T{}, issuerKeyPem)
+
+	newKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return core.Certificate{}, fmt.Errorf("failed to create test key: %w", err)
+	}
+
+	sn, err := core.StringToSerial(serial)
+	if err != nil {
+		return core.Certificate{}, fmt.Errorf("failed to parse test serial: %w", err)
+	}
+
+	template := &x509.Certificate{
+		SerialNumber: sn,
+		DNSNames:     []string{"new.ee.boulder.test"},
+	}
+
+	certDER, err := x509.CreateCertificate(rand.Reader, template, issuer, &newKey.PublicKey, issuerKey)
+	if err != nil {
+		return core.Certificate{}, fmt.Errorf("failed to issue test cert: %w", err)
+	}
+
+	cert, err := x509.ParseCertificate(certDER)
+	if err != nil {
+		return core.Certificate{}, fmt.Errorf("failed to parse test cert: %w", err)
+	}
+
+	return core.Certificate{
+		RegistrationID: 1,
+		Serial:         core.SerialToString(cert.SerialNumber),
+		Issued:         sa.clk.Now().Add(-1 * time.Second),
+		DER:            cert.Raw,
+	}, nil
+}
+
+// TestGetCertificateNew tests for the case when the certificate is new (by
+// dynamically generating it at test time), and therefore isn't served by the
+// GET api.
+func TestGetCertificateNew(t *testing.T) {
+	wfe, fc := setupWFE(t)
+	wfe.SA = &mockSAWithNewCert{wfe.SA, fc}
+	mux := wfe.Handler(metrics.NoopRegisterer)
+
+	makeGet := func(path string) *http.Request {
+		return &http.Request{URL: &url.URL{Path: path}, Method: "GET"}
+	}
+
+	makePost := func(keyID int64, key interface{}, path, body string) *http.Request {
+		_, _, jwsBody := signRequestKeyID(t, keyID, key, fmt.Sprintf("http://localhost%s", path), body, wfe.nonceService)
+		return makePostRequestWithPath(path, jwsBody)
+	}
+
+	altKey := loadKey(t, []byte(test2KeyPrivatePEM))
+	_, ok := altKey.(*rsa.PrivateKey)
+	test.Assert(t, ok, "Couldn't load RSA key")
+
+	pkixContent := "application/pem-certificate-chain"
+	noCache := "public, max-age=0, no-cache"
+
+	testCases := []struct {
+		Name            string
+		Request         *http.Request
+		ExpectedStatus  int
+		ExpectedHeaders map[string]string
+		ExpectedBody    string
+	}{
+		{
+			Name:           "Get",
+			Request:        makeGet("/get/cert/000000000000000000000000000000000001"),
+			ExpectedStatus: http.StatusForbidden,
+			ExpectedBody: `{
+				"type": "` + probs.V2ErrorNS + `unauthorized",
+				"detail": "Certificate is too new for GET API. You should only use this non-standard API to access resources created more than 10s ago",
+				"status": 403
+			}`,
+		},
+		{
+			Name:           "ACME Get",
+			Request:        makeGet("/acme/cert/000000000000000000000000000000000002"),
+			ExpectedStatus: http.StatusOK,
+			ExpectedHeaders: map[string]string{
+				"Content-Type": pkixContent,
+			},
+		},
+		{
+			Name:           "ACME POST-as-GET",
+			Request:        makePost(1, nil, "/acme/cert/000000000000000000000000000000000003", ""),
+			ExpectedStatus: http.StatusOK,
+			ExpectedHeaders: map[string]string{
+				"Content-Type": pkixContent,
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.Name, func(t *testing.T) {
+			responseWriter := httptest.NewRecorder()
+			mockLog := wfe.log.(*blog.Mock)
+			mockLog.Clear()
+
+			// Mux a request for a certificate
+			mux.ServeHTTP(responseWriter, tc.Request)
+			headers := responseWriter.Header()
+
+			// Assert that the status code written is as expected
+			test.AssertEquals(t, responseWriter.Code, tc.ExpectedStatus)
+
+			// All of the responses should have the correct cache control header
+			test.AssertEquals(t, headers.Get("Cache-Control"), noCache)
+
+			// If the test cases expects additional headers, check those too
+			for h, v := range tc.ExpectedHeaders {
+				test.AssertEquals(t, headers.Get(h), v)
+			}
+
+			// If we're expecting a particular body (because of an error), check that.
+			if tc.ExpectedBody != "" {
+				body := responseWriter.Body.String()
+				test.AssertUnmarshaledEquals(t, body, tc.ExpectedBody)
+
+				// Unsuccessful requests should be logged as such
+				reqlogs := mockLog.GetAllMatching(fmt.Sprintf(`INFO: [^ ]+ [^ ]+ [^ ]+ %d .*`, tc.ExpectedStatus))
+				if len(reqlogs) != 1 {
+					t.Errorf("Didn't find info logs with code %d. Instead got:\n%s\n",
+						tc.ExpectedStatus, strings.Join(mockLog.GetAllMatching(`.*`), "\n"))
+				}
+			}
+		})
+	}
+}
+
 // This uses httptest.NewServer because ServeMux.ServeHTTP won't prevent the
 // body from being sent like the net/http Server's actually do.
 func TestGetCertificateHEADHasCorrectBodyLength(t *testing.T) {
 	wfe, _ := setupWFE(t)
+	wfe.SA = newMockSAWithCert(t, wfe.SA, core.OCSPStatusGood)
 
-	certPemBytes, _ := ioutil.ReadFile("test/178.crt")
-	chainPemBytes, _ := ioutil.ReadFile("../test/test-ca2.pem")
-	chain := fmt.Sprintf("%s\n%s", string(chainPemBytes), string(certPemBytes))
+	certPemBytes, _ := ioutil.ReadFile("../test/hierarchy/ee-r3.cert.pem")
+	cert, err := core.LoadCert("../test/hierarchy/ee-r3.cert.pem")
+	test.AssertNotError(t, err, "failed to load test certificate")
+
+	chainPemBytes, err := ioutil.ReadFile("../test/hierarchy/int-r3.cert.pem")
+	test.AssertNotError(t, err, "Error reading ../test/hierarchy/int-r3.cert.pem")
+	chain := fmt.Sprintf("%s\n%s", string(certPemBytes), string(chainPemBytes))
 	chainLen := strconv.Itoa(len(chain))
 
 	mockLog := wfe.log.(*blog.Mock)
@@ -2009,7 +2162,8 @@ func TestGetCertificateHEADHasCorrectBodyLength(t *testing.T) {
 	mux := wfe.Handler(metrics.NoopRegisterer)
 	s := httptest.NewServer(mux)
 	defer s.Close()
-	req, _ := http.NewRequest("HEAD", s.URL+"/acme/cert/0000000000000000000000000000000000b2", nil)
+	req, _ := http.NewRequest(
+		"HEAD", fmt.Sprintf("%s/acme/cert/%s", s.URL, core.SerialToString(cert.SerialNumber)), nil)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		test.AssertNotError(t, err, "do error")
@@ -2025,6 +2179,44 @@ func TestGetCertificateHEADHasCorrectBodyLength(t *testing.T) {
 	test.AssertEquals(t, resp.StatusCode, 200)
 	test.AssertEquals(t, chainLen, resp.Header.Get("Content-Length"))
 	test.AssertEquals(t, 0, len(body))
+}
+
+type mockSAWithError struct {
+	core.StorageGetter
+}
+
+func (sa *mockSAWithError) GetCertificate(_ context.Context, serial string) (core.Certificate, error) {
+	return core.Certificate{}, errors.New("Oops")
+}
+
+func TestGetCertificateServerError(t *testing.T) {
+	// TODO: add tests for failure to parse the retrieved cert, a cert whose
+	// IssuerNameID is unknown, and a cert whose signature can't be verified.
+	wfe, _ := setupWFE(t)
+	wfe.SA = &mockSAWithError{wfe.SA}
+	mux := wfe.Handler(metrics.NoopRegisterer)
+
+	cert, err := core.LoadCert("../test/hierarchy/ee-r3.cert.pem")
+	test.AssertNotError(t, err, "failed to load test certificate")
+
+	reqPath := fmt.Sprintf("/acme/cert/%s", core.SerialToString(cert.SerialNumber))
+	req := &http.Request{URL: &url.URL{Path: reqPath}, Method: "GET"}
+
+	// Mux a request for a certificate
+	responseWriter := httptest.NewRecorder()
+	mux.ServeHTTP(responseWriter, req)
+
+	test.AssertEquals(t, responseWriter.Code, http.StatusInternalServerError)
+
+	noCache := "public, max-age=0, no-cache"
+	test.AssertEquals(t, responseWriter.Header().Get("Cache-Control"), noCache)
+
+	body := `{
+		"type": "urn:ietf:params:acme:error:serverInternal",
+		"status": 500,
+		"detail": "Failed to retrieve certificate"
+	}`
+	test.AssertUnmarshaledEquals(t, responseWriter.Body.String(), body)
 }
 
 func newRequestEvent() *web.RequestEvent {
@@ -2132,7 +2324,6 @@ func TestDeactivateAccount(t *testing.T) {
 		    "mailto:person@mail.com"
 		  ],
 		  "initialIp": "",
-		  "createdAt": "0001-01-01T00:00:00Z",
 		  "status": "deactivated"
 		}`)
 
@@ -2153,7 +2344,6 @@ func TestDeactivateAccount(t *testing.T) {
 		    "mailto:person@mail.com"
 		  ],
 		  "initialIp": "",
-		  "createdAt": "0001-01-01T00:00:00Z",
 		  "status": "deactivated"
 		}`)
 
@@ -2205,6 +2395,31 @@ func TestNewOrder(t *testing.T) {
 		]
 	}`
 
+	// Body with a SAN that is longer than 64 bytes. This one is 65 bytes.
+	tooLongCNBody := `
+	{
+		"Identifiers": [
+			{
+				"type": "dns",
+				"value": "thisreallylongexampledomainisabytelongerthanthemaxcnbytelimit.com"
+			}
+		]
+	}`
+
+	oneLongOneShortCNBody := `
+	{
+		"Identifiers": [
+			{
+				"type": "dns",
+				"value": "thisreallylongexampledomainisabytelongerthanthemaxcnbytelimit.com"
+			},
+			{
+				"type": "dns",
+				"value": "not-example.com"
+			}
+		]
+	}`
+
 	testCases := []struct {
 		Name            string
 		Request         *http.Request
@@ -2253,12 +2468,34 @@ func TestNewOrder(t *testing.T) {
 			ExpectedBody: `{"type":"` + probs.V2ErrorNS + `malformed","detail":"NotBefore and NotAfter are not supported","status":400}`,
 		},
 		{
+			Name:         "POST, no potential CNs 64 bytes or smaller",
+			Request:      signAndPost(t, targetPath, signedURL, tooLongCNBody, 1, wfe.nonceService),
+			ExpectedBody: `{"type":"` + probs.V2ErrorNS + `rejectedIdentifier","detail":"NewOrder request did not include a SAN short enough to fit in CN","status":400}`,
+		},
+		{
+			Name:    "POST, good payload, one potential CNs less than 64 bytes and one longer",
+			Request: signAndPost(t, targetPath, signedURL, oneLongOneShortCNBody, 1, wfe.nonceService),
+			ExpectedBody: `
+			{
+				"status": "pending",
+				"expires": "2021-02-01T01:01:01Z",
+				"identifiers": [
+					{ "type": "dns", "value": "thisreallylongexampledomainisabytelongerthanthemaxcnbytelimit.com"},
+					{ "type": "dns", "value": "not-example.com"}
+				],
+				"authorizations": [
+					"http://localhost/acme/authz-v3/1"
+				],
+				"finalize": "http://localhost/acme/finalize/1/1"
+			}`,
+		},
+		{
 			Name:    "POST, good payload",
 			Request: signAndPost(t, targetPath, signedURL, validOrderBody, 1, wfe.nonceService),
 			ExpectedBody: `
 					{
 						"status": "pending",
-						"expires": "1970-01-01T00:00:00Z",
+						"expires": "2021-02-01T01:01:01Z",
 						"identifiers": [
 							{ "type": "dns", "value": "not-example.com"},
 							{ "type": "dns", "value": "www.not-example.com"}
@@ -2505,7 +2742,6 @@ func TestKeyRollover(t *testing.T) {
 		       "mailto:person@mail.com"
 		     ],
 		     "initialIp": "",
-		     "createdAt": "0001-01-01T00:00:00Z",
 		     "status": "valid"
 		   }`,
 			NewKey: newKeyPriv,
@@ -2521,8 +2757,8 @@ func TestKeyRollover(t *testing.T) {
 			wfe.KeyRollover(ctx, newRequestEvent(), responseWriter, makePostRequestWithPath("key-change", outer))
 			test.AssertUnmarshaledEquals(t, responseWriter.Body.String(), tc.ExpectedResponse)
 			if tc.ErrorStatType != "" {
-				test.AssertEquals(t, test.CountCounterVec(
-					"type", tc.ErrorStatType, wfe.stats.joseErrorCount), 1)
+				test.AssertMetricWithLabelsEquals(
+					t, wfe.stats.joseErrorCount, prometheus.Labels{"type": tc.ErrorStatType}, 1)
 			}
 		})
 	}
@@ -2648,7 +2884,7 @@ func TestGetOrder(t *testing.T) {
 }
 
 func makeRevokeRequestJSON(reason *revocation.Reason) ([]byte, error) {
-	certPemBytes, err := ioutil.ReadFile("test/238.crt")
+	certPemBytes, err := ioutil.ReadFile("../test/hierarchy/ee-r3.cert.pem")
 	if err != nil {
 		return nil, err
 	}
@@ -2674,102 +2910,72 @@ func makeRevokeRequestJSONForCert(der []byte, reason *revocation.Reason) ([]byte
 	return revokeRequestJSON, nil
 }
 
-// A SA mock that always returns a berrors.NotFound type error. This is necessary
-// because the standard mock in our mocks package always returns a given test
-// registration when GetRegistrationByKey is called, and we want to get a
-// berrors.NotFound type error for tests that pass regCheck = false to verifyPOST.
-type mockSANoSuchRegistration struct {
-	core.StorageGetter
-}
-
-func (msa mockSANoSuchRegistration) GetRegistrationByKey(ctx context.Context, jwk *jose.JSONWebKey) (core.Registration, error) {
-	return core.Registration{}, berrors.NotFoundError("reg not found")
-}
-
 // Valid revocation request for existing, non-revoked cert, signed with cert
 // key.
-func TestRevokeCertificateCertKey(t *testing.T) {
-	wfe, fc := setupWFE(t)
-	wfe.SA = &mockSANoSuchRegistration{mocks.NewStorageAuthority(fc)}
-	responseWriter := httptest.NewRecorder()
+func TestRevokeCertificateValid(t *testing.T) {
+	wfe, _ := setupWFE(t)
+	wfe.SA = newMockSAWithCert(t, wfe.SA, core.OCSPStatusGood)
 
-	keyPemBytes, err := ioutil.ReadFile("test/238.key")
+	keyPemBytes, err := ioutil.ReadFile("../test/hierarchy/ee-r3.key.pem")
 	test.AssertNotError(t, err, "Failed to load key")
 	key := loadKey(t, keyPemBytes)
 
 	revokeRequestJSON, err := makeRevokeRequestJSON(nil)
 	test.AssertNotError(t, err, "Failed to make revokeRequestJSON")
-
 	_, _, jwsBody := signRequestEmbed(t,
 		key, "http://localhost/revoke-cert", string(revokeRequestJSON), wfe.nonceService)
 
+	responseWriter := httptest.NewRecorder()
 	wfe.RevokeCertificate(ctx, newRequestEvent(), responseWriter,
 		makePostRequestWithPath("revoke-cert", jwsBody))
 	test.AssertEquals(t, responseWriter.Code, 200)
 	test.AssertEquals(t, responseWriter.Body.String(), "")
 }
 
-// Valid revocation request for existing, non-revoked cert, signed with cert
-// key, precertificate revocation feature flag enabled.
-func TestRevokePreCertificateFeatureEnabled(t *testing.T) {
-	_ = features.Set(map[string]bool{"PrecertificateRevocation": true})
-	defer features.Reset()
-
-	wfe, fc := setupWFE(t)
-	wfe.SA = &mockSANoSuchRegistration{mocks.NewStorageAuthority(fc)}
-	responseWriter := httptest.NewRecorder()
-
-	keyPemBytes, err := ioutil.ReadFile("test/238.key")
-	test.AssertNotError(t, err, "Failed to load key")
-	key := loadKey(t, keyPemBytes)
-
-	revokeRequestJSON, err := makeRevokeRequestJSON(nil)
-	test.AssertNotError(t, err, "Failed to make revokeRequestJSON")
-
-	_, _, jwsBody := signRequestEmbed(t,
-		key, "http://localhost/revoke-cert", string(revokeRequestJSON), wfe.nonceService)
-
-	// Revoking a certificate that was issued by a known issuer should work
-	wfe.RevokeCertificate(ctx, newRequestEvent(), responseWriter,
-		makePostRequestWithPath("revoke-cert", jwsBody))
-	test.AssertEquals(t, responseWriter.Code, 200)
-	test.AssertEquals(t, responseWriter.Body.String(), "")
+// Invalid revocation request: although signed with the cert key, the cert
+// wasn't issued by any issuer the Boulder is aware of.
+func TestRevokeCertificateNotIssued(t *testing.T) {
+	wfe, _ := setupWFE(t)
+	wfe.SA = newMockSAWithCert(t, wfe.SA, core.OCSPStatusGood)
 
 	// Make a self-signed junk certificate
 	k, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	test.AssertNotError(t, err, "unexpected error making random private key")
-	// Use a known serial from the mocks/mocks.go GetCertificate mock. This
-	// shouldn't matter for the precertificate revocation feature flag flow but
-	// will ensure we don't get a 404 response from the feature flag being handled
-	// incorrectly and the GetCertificate() mock not knowing the serial.
-	knownSerial, err := core.StringToSerial("0000000000000000000000000000000000ee")
-	test.AssertNotError(t, err, "Unexpected error converting known serial to bigint")
+	// Use a known serial from the mockSAWithValidCert mock.
+	// This ensures that any failures here are due to the certificate's issuer
+	// not matching up with issuers known by the mock, rather than due to the
+	// certificate's serial not matching up with serials known by the mock.
+	knownCert, err := core.LoadCert("../test/hierarchy/ee-r3.cert.pem")
+	test.AssertNotError(t, err, "Unexpected error loading test cert")
 	template := &x509.Certificate{
-		SerialNumber: knownSerial,
+		SerialNumber: knownCert.SerialNumber,
 	}
 	certDER, err := x509.CreateCertificate(rand.Reader, template, template, k.Public(), k)
 	test.AssertNotError(t, err, "Unexpected error creating self-signed junk cert")
-	revokeRequestJSON, err = makeRevokeRequestJSONForCert(certDER, nil)
-	test.AssertNotError(t, err, "Failed to make revokeRequestJSON for certDER")
 
-	// Revoking a certificate that wasn't signed by a known issuer should fail
-	responseWriter = httptest.NewRecorder()
-	_, _, jwsBody = signRequestEmbed(t,
+	keyPemBytes, err := ioutil.ReadFile("../test/hierarchy/ee-r3.key.pem")
+	test.AssertNotError(t, err, "Failed to load key")
+	key := loadKey(t, keyPemBytes)
+
+	revokeRequestJSON, err := makeRevokeRequestJSONForCert(certDER, nil)
+	test.AssertNotError(t, err, "Failed to make revokeRequestJSON for certDER")
+	_, _, jwsBody := signRequestEmbed(t,
 		key, "http://localhost/revoke-cert", string(revokeRequestJSON), wfe.nonceService)
+
+	responseWriter := httptest.NewRecorder()
 	wfe.RevokeCertificate(ctx, newRequestEvent(), responseWriter,
 		makePostRequestWithPath("revoke-cert", jwsBody))
 	// It should result in a 404 response with a problem body
 	test.AssertEquals(t, responseWriter.Code, 404)
-	test.AssertEquals(t, responseWriter.Body.String(), "{\n  \"type\": \"urn:ietf:params:acme:error:malformed\",\n  \"detail\": \"No such certificate\",\n  \"status\": 404\n}")
+	test.AssertEquals(t, responseWriter.Body.String(), "{\n  \"type\": \"urn:ietf:params:acme:error:malformed\",\n  \"detail\": \"Certificate from unrecognized issuer\",\n  \"status\": 404\n}")
 }
 
 func TestRevokeCertificateReasons(t *testing.T) {
-	wfe, fc := setupWFE(t)
+	wfe, _ := setupWFE(t)
+	wfe.SA = newMockSAWithCert(t, wfe.SA, core.OCSPStatusGood)
 	ra := wfe.RA.(*MockRegistrationAuthority)
-	wfe.SA = &mockSANoSuchRegistration{mocks.NewStorageAuthority(fc)}
-	responseWriter := httptest.NewRecorder()
 
-	keyPemBytes, err := ioutil.ReadFile("test/238.key")
+	keyPemBytes, err := ioutil.ReadFile("../test/hierarchy/ee-r3.key.pem")
 	test.AssertNotError(t, err, "Failed to load key")
 	key := loadKey(t, keyPemBytes)
 
@@ -2812,10 +3018,12 @@ func TestRevokeCertificateReasons(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.Name, func(t *testing.T) {
-			responseWriter = httptest.NewRecorder()
 			revokeRequestJSON, err := makeRevokeRequestJSON(tc.Reason)
 			test.AssertNotError(t, err, "Failed to make revokeRequestJSON")
-			_, _, jwsBody := signRequestEmbed(t, key, "http://localhost/revoke-cert", string(revokeRequestJSON), wfe.nonceService)
+			_, _, jwsBody := signRequestEmbed(
+				t, key, "http://localhost/revoke-cert", string(revokeRequestJSON), wfe.nonceService)
+
+			responseWriter := httptest.NewRecorder()
 			wfe.RevokeCertificate(ctx, newRequestEvent(), responseWriter,
 				makePostRequestWithPath("revoke-cert", jwsBody))
 
@@ -2836,14 +3044,17 @@ func TestRevokeCertificateReasons(t *testing.T) {
 // that issued the cert.
 func TestRevokeCertificateIssuingAccount(t *testing.T) {
 	wfe, _ := setupWFE(t)
-	responseWriter := httptest.NewRecorder()
+	wfe.SA = newMockSAWithCert(t, wfe.SA, core.OCSPStatusGood)
+
 	revokeRequestJSON, err := makeRevokeRequestJSON(nil)
 	test.AssertNotError(t, err, "Failed to make revokeRequestJSON")
-
 	// NOTE: this account doesn't have any authorizations for the
 	// names in the cert, but it is the account that issued it
 	// originally
-	_, _, jwsBody := signRequestKeyID(t, 1, nil, "http://localhost/revoke-cert", string(revokeRequestJSON), wfe.nonceService)
+	_, _, jwsBody := signRequestKeyID(
+		t, 1, nil, "http://localhost/revoke-cert", string(revokeRequestJSON), wfe.nonceService)
+
+	responseWriter := httptest.NewRecorder()
 	wfe.RevokeCertificate(ctx, newRequestEvent(), responseWriter,
 		makePostRequestWithPath("revoke-cert", jwsBody))
 
@@ -2851,21 +3062,39 @@ func TestRevokeCertificateIssuingAccount(t *testing.T) {
 	test.AssertEquals(t, responseWriter.Body.String(), "")
 }
 
+type mockSAWithValidAuthz struct {
+	core.StorageGetter
+}
+
+// GetValidAuthorizations says that all accounts have a valid authorization to
+// issue for the DNS name contained in ee-r3.cert.pem
+func (sa mockSAWithValidAuthz) GetValidAuthorizations2(_ context.Context, _ *sapb.GetValidAuthorizationsRequest) (*sapb.Authorizations, error) {
+	res := sapb.Authorizations{}
+	res.Authz = append(res.Authz, &sapb.Authorizations_MapElement{
+		Domain: "ee.int-r3.boulder.test",
+		Authz:  &corepb.Authorization{},
+	})
+	return &res, nil
+}
+
 // Valid revocation request for existing, non-revoked cert, signed with account
 // that has authorizations for names in cert
 func TestRevokeCertificateWithAuthorizations(t *testing.T) {
 	wfe, _ := setupWFE(t)
-	responseWriter := httptest.NewRecorder()
+	wfe.SA = mockSAWithValidAuthz{newMockSAWithCert(t, wfe.SA, core.OCSPStatusGood)}
+
 	revokeRequestJSON, err := makeRevokeRequestJSON(nil)
 	test.AssertNotError(t, err, "Failed to make revokeRequestJSON")
 
-	// NOTE(@cpu): Account ID #5 is specifically handled in mocks.go
-	// GetValidAuthorizations to have the authz for the certificate used in
-	// `makeRevokeRequestJSON`
-	_, _, jwsBody := signRequestKeyID(t, 5, nil, "http://localhost/revoke-cert", string(revokeRequestJSON), wfe.nonceService)
+	// We use account 5 here because using account 1 would short-circuit based on
+	// that account having issued the cert, and not make it to the authorization
+	// checking logic.
+	_, _, jwsBody := signRequestKeyID(
+		t, 5, nil, "http://localhost/revoke-cert", string(revokeRequestJSON), wfe.nonceService)
+
+	responseWriter := httptest.NewRecorder()
 	wfe.RevokeCertificate(ctx, newRequestEvent(), responseWriter,
 		makePostRequestWithPath("revoke-cert", jwsBody))
-
 	test.AssertEquals(t, responseWriter.Code, 200)
 	test.AssertEquals(t, responseWriter.Body.String(), "")
 }
@@ -2873,44 +3102,62 @@ func TestRevokeCertificateWithAuthorizations(t *testing.T) {
 // A revocation request signed by an unauthorized key.
 func TestRevokeCertificateWrongKey(t *testing.T) {
 	wfe, _ := setupWFE(t)
-	responseWriter := httptest.NewRecorder()
-	revokeRequestJSON, err := makeRevokeRequestJSON(nil)
-	test.AssertNotError(t, err, "Failed to make revokeRequestJSON")
+	wfe.SA = newMockSAWithCert(t, wfe.SA, core.OCSPStatusGood)
 
 	test2JWK := loadKey(t, []byte(test2KeyPrivatePEM))
-	_, _, jwsBody := signRequestKeyID(t, 2, test2JWK, "http://localhost/revoke-cert", string(revokeRequestJSON), wfe.nonceService)
+
+	revokeRequestJSON, err := makeRevokeRequestJSON(nil)
+	test.AssertNotError(t, err, "Failed to make revokeRequestJSON")
+	_, _, jwsBody := signRequestKeyID(
+		t, 2, test2JWK, "http://localhost/revoke-cert", string(revokeRequestJSON), wfe.nonceService)
+
+	responseWriter := httptest.NewRecorder()
 	wfe.RevokeCertificate(ctx, newRequestEvent(), responseWriter,
 		makePostRequestWithPath("revoke-cert", jwsBody))
-
 	test.AssertEquals(t, responseWriter.Code, 403)
 	test.AssertUnmarshaledEquals(t, responseWriter.Body.String(),
 		`{"type":"`+probs.V2ErrorNS+`unauthorized","detail":"The key ID specified in the revocation request does not hold valid authorizations for all names in the certificate to be revoked","status":403}`)
 }
 
-// Valid revocation request for already-revoked cert
-func TestRevokeCertificateAlreadyRevoked(t *testing.T) {
+func TestRevokeCertificateExpired(t *testing.T) {
 	wfe, fc := setupWFE(t)
-	wfe.SA = &mockSANoSuchRegistration{mocks.NewStorageAuthority(fc)}
+	wfe.SA = newMockSAWithCert(t, wfe.SA, core.OCSPStatusGood)
 
-	keyPemBytes, err := ioutil.ReadFile("test/178.key")
+	keyPemBytes, err := ioutil.ReadFile("../test/hierarchy/ee-r3.key.pem")
 	test.AssertNotError(t, err, "Failed to load key")
 	key := loadKey(t, keyPemBytes)
 
-	certPemBytes, err := ioutil.ReadFile("test/178.crt")
-	test.AssertNotError(t, err, "Failed to load cert")
-	certBlock, _ := pem.Decode(certPemBytes)
-	test.Assert(t, certBlock != nil, "Failed to decode PEM")
+	revokeRequestJSON, err := makeRevokeRequestJSON(nil)
+	test.AssertNotError(t, err, "Failed to make revokeRequestJSON")
 
-	revokeRequest := struct {
-		CertificateDER core.JSONBuffer `json:"certificate"`
-	}{
-		CertificateDER: certBlock.Bytes,
-	}
-	revokeRequestJSON, err := json.Marshal(revokeRequest)
-	test.AssertNotError(t, err, "Failed to marshal request")
+	_, _, jwsBody := signRequestEmbed(
+		t, key, "http://localhost/revoke-cert", string(revokeRequestJSON), wfe.nonceService)
+
+	cert, err := core.LoadCert("../test/hierarchy/ee-r3.cert.pem")
+	test.AssertNotError(t, err, "Failed to load test certificate")
+
+	fc.Set(cert.NotAfter.Add(time.Hour))
 
 	responseWriter := httptest.NewRecorder()
-	responseWriter.Body.Reset()
+	wfe.RevokeCertificate(ctx, newRequestEvent(), responseWriter,
+		makePostRequestWithPath("revoke-cert", jwsBody))
+	test.AssertEquals(t, responseWriter.Code, 403)
+	test.AssertEquals(t, responseWriter.Body.String(), "{\n  \"type\": \"urn:ietf:params:acme:error:unauthorized\",\n  \"detail\": \"Certificate is expired\",\n  \"status\": 403\n}")
+}
+
+// Valid revocation request for already-revoked cert
+func TestRevokeCertificateAlreadyRevoked(t *testing.T) {
+	wfe, _ := setupWFE(t)
+	wfe.SA = newMockSAWithCert(t, wfe.SA, core.OCSPStatusRevoked)
+
+	responseWriter := httptest.NewRecorder()
+
+	keyPemBytes, err := ioutil.ReadFile("../test/hierarchy/ee-r3.key.pem")
+	test.AssertNotError(t, err, "Failed to load key")
+	key := loadKey(t, keyPemBytes)
+
+	revokeRequestJSON, err := makeRevokeRequestJSON(nil)
+	test.AssertNotError(t, err, "Failed to make revokeRequestJSON")
 
 	_, _, jwsBody := signRequestEmbed(t, key, "http://localhost/revoke-cert", string(revokeRequestJSON), wfe.nonceService)
 	wfe.RevokeCertificate(ctx, newRequestEvent(), responseWriter,
@@ -2919,55 +3166,6 @@ func TestRevokeCertificateAlreadyRevoked(t *testing.T) {
 	test.AssertEquals(t, responseWriter.Code, 400)
 	test.AssertUnmarshaledEquals(t, responseWriter.Body.String(),
 		`{"type":"`+probs.V2ErrorNS+`alreadyRevoked","detail":"Certificate already revoked","status":400}`)
-}
-
-func TestRevokeCertificateWithAuthz(t *testing.T) {
-	wfe, _ := setupWFE(t)
-	responseWriter := httptest.NewRecorder()
-	test4JWK := loadKey(t, []byte(test4KeyPrivatePEM))
-	revokeRequestJSON, err := makeRevokeRequestJSON(nil)
-	test.AssertNotError(t, err, "Unable to create revoke request")
-
-	// NOTE(@cpu): Account ID #4 is specifically handled in mocks.go
-	// GetValidAuthorizations to have an authz for "bad.example.com"
-	_, _, jwsBody := signRequestKeyID(t, 4, test4JWK, "http://localhost/revoke-cert", string(revokeRequestJSON), wfe.nonceService)
-	wfe.RevokeCertificate(ctx, newRequestEvent(), responseWriter,
-		makePostRequestWithPath("revoke-cert", jwsBody))
-
-	test.AssertEquals(t, responseWriter.Code, 200)
-	test.AssertEquals(t, responseWriter.Body.String(), "")
-}
-
-func TestRevokeCertificateExpired(t *testing.T) {
-	wfe, fc := setupWFE(t)
-	responseWriter := httptest.NewRecorder()
-	test4JWK := loadKey(t, []byte(test4KeyPrivatePEM))
-
-	certPemBytes, err := ioutil.ReadFile("test/238.crt")
-	test.AssertNotError(t, err, "failed to read test/238.crt")
-	certBlock, _ := pem.Decode(certPemBytes)
-	test.AssertNotError(t, err, "failed to parse test/238.crt")
-	reason := revocation.Reason(0)
-	revokeRequest := struct {
-		CertificateDER core.JSONBuffer    `json:"certificate"`
-		Reason         *revocation.Reason `json:"reason"`
-	}{
-		CertificateDER: certBlock.Bytes,
-		Reason:         &reason,
-	}
-	revokeRequestJSON, err := json.Marshal(revokeRequest)
-	test.AssertNotError(t, err, "failed to marshal revocation request")
-
-	parsedCertificate, err := x509.ParseCertificate(certBlock.Bytes)
-	test.AssertNotError(t, err, "failed to parse test cert")
-	fc.Set(parsedCertificate.NotAfter.Add(time.Hour))
-
-	_, _, jwsBody := signRequestKeyID(t, 4, test4JWK, "http://localhost/revoke-cert", string(revokeRequestJSON), wfe.nonceService)
-	wfe.RevokeCertificate(ctx, newRequestEvent(), responseWriter,
-		makePostRequestWithPath("revoke-cert", jwsBody))
-
-	test.AssertEquals(t, responseWriter.Code, 403)
-	test.AssertEquals(t, responseWriter.Body.String(), "{\n  \"type\": \"urn:ietf:params:acme:error:unauthorized\",\n  \"detail\": \"Certificate is expired\",\n  \"status\": 403\n}")
 }
 
 type mockSAGetRegByKeyFails struct {
@@ -2981,8 +3179,8 @@ func (sa *mockSAGetRegByKeyFails) GetRegistrationByKey(ctx context.Context, jwk 
 // When SA.GetRegistrationByKey errors (e.g. gRPC timeout), NewAccount should
 // return internal server errors.
 func TestNewAccountWhenGetRegByKeyFails(t *testing.T) {
-	wfe, fc := setupWFE(t)
-	wfe.SA = &mockSAGetRegByKeyFails{mocks.NewStorageAuthority(fc)}
+	wfe, _ := setupWFE(t)
+	wfe.SA = &mockSAGetRegByKeyFails{wfe.SA}
 	key := loadKey(t, []byte(testE2KeyPrivatePEM))
 	_, ok := key.(*ecdsa.PrivateKey)
 	test.Assert(t, ok, "Couldn't load ECDSA key")
@@ -3010,8 +3208,8 @@ func (sa *mockSAGetRegByKeyNotFound) GetRegistrationByKey(ctx context.Context, j
 }
 
 func TestNewAccountWhenGetRegByKeyNotFound(t *testing.T) {
-	wfe, fc := setupWFE(t)
-	wfe.SA = &mockSAGetRegByKeyNotFound{mocks.NewStorageAuthority(fc)}
+	wfe, _ := setupWFE(t)
+	wfe.SA = &mockSAGetRegByKeyNotFound{wfe.SA}
 	key := loadKey(t, []byte(testE2KeyPrivatePEM))
 	_, ok := key.(*ecdsa.PrivateKey)
 	test.Assert(t, ok, "Couldn't load ECDSA key")
@@ -3312,8 +3510,33 @@ func TestGETAPIChallenge(t *testing.T) {
 	}
 }
 
+// TestGet404 tests that a 404 is served and that the expected endpoint of
+// "/" is logged when an unknown path is requested. This will test the
+// codepath to the wfe.Index() handler which handles "/" and all non-api
+// endpoint requests to make sure the endpoint is set properly in the logs.
+func TestIndexGet404(t *testing.T) {
+	// Setup
+	wfe, _ := setupWFE(t)
+	path := "/nopathhere/nope/nofilehere"
+	req := &http.Request{URL: &url.URL{Path: path}, Method: "GET"}
+	logEvent := &web.RequestEvent{}
+	responseWriter := httptest.NewRecorder()
+
+	// Send a request to wfe.Index()
+	wfe.Index(context.Background(), logEvent, responseWriter, req)
+
+	// Test that a 404 is received as expected
+	test.AssertEquals(t, responseWriter.Code, http.StatusNotFound)
+	// Test that we logged the "/" endpoint
+	test.AssertEquals(t, logEvent.Endpoint, "/")
+	// Test that the rest of the path is logged as the slug
+	test.AssertEquals(t, logEvent.Slug, path[1:])
+}
+
 func TestGetAPIAndMandatoryPOSTAsGET(t *testing.T) {
 	wfe, _ := setupWFE(t)
+	wfe.SA = newMockSAWithCert(t, wfe.SA, core.OCSPStatusGood)
+
 	makeGet := func(path, endpoint string) (*http.Request, *web.RequestEvent) {
 		return &http.Request{URL: &url.URL{Path: path}, Method: "GET"},
 			&web.RequestEvent{Endpoint: endpoint, Extra: map[string]interface{}{}}
@@ -3321,8 +3544,10 @@ func TestGetAPIAndMandatoryPOSTAsGET(t *testing.T) {
 	_ = features.Set(map[string]bool{"MandatoryPOSTAsGET": true})
 	defer features.Reset()
 
-	oldSerial := "0000000000000000000000000000000000b2"
-	req, event := makeGet(oldSerial, getCertPath)
+	cert, err := core.LoadCert("../test/hierarchy/ee-r3.cert.pem")
+	test.AssertNotError(t, err, "failed to load test certificate")
+
+	req, event := makeGet(core.SerialToString(cert.SerialNumber), getCertPath)
 	resp := httptest.NewRecorder()
 	wfe.Certificate(context.Background(), event, resp, req)
 	test.AssertEquals(t, resp.Code, 200)

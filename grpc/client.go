@@ -5,12 +5,17 @@ import (
 	"errors"
 	"net"
 
-	"github.com/grpc-ecosystem/go-grpc-prometheus"
+	grpc_prometheus "github.com/grpc-ecosystem/go-grpc-prometheus"
+	"github.com/honeycombio/beeline-go/wrappers/hnygrpc"
 	"github.com/jmhodges/clock"
 	"github.com/letsencrypt/boulder/cmd"
 	bcreds "github.com/letsencrypt/boulder/grpc/creds"
 	"github.com/prometheus/client_golang/prometheus"
 	"google.golang.org/grpc"
+
+	// Import for its init function, which causes clients to rely on the
+	// Health Service for load-balancing.
+	_ "google.golang.org/grpc/health"
 )
 
 // ClientSetup creates a gRPC TransportCredentials that presents
@@ -28,11 +33,6 @@ func ClientSetup(c *cmd.GRPCClientConfig, tlsConfig *tls.Config, metrics clientM
 		return nil, errNilTLS
 	}
 
-	// Set the only acceptable TLS version to 1.2 and the only acceptable cipher suite
-	// to ECDHE-RSA-CHACHA20-POLY1305.
-	tlsConfig.MinVersion, tlsConfig.MaxVersion = tls.VersionTLS12, tls.VersionTLS12
-	tlsConfig.CipherSuites = []uint16{tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305}
-
 	ci := clientInterceptor{c.Timeout.Duration, metrics, clk}
 	host, _, err := net.SplitHostPort(c.ServerAddress)
 	if err != nil {
@@ -43,7 +43,11 @@ func ClientSetup(c *cmd.GRPCClientConfig, tlsConfig *tls.Config, metrics clientM
 		"dns:///"+c.ServerAddress,
 		grpc.WithBalancerName("round_robin"),
 		grpc.WithTransportCredentials(creds),
-		grpc.WithUnaryInterceptor(ci.intercept),
+		grpc.WithChainUnaryInterceptor(
+			ci.intercept,
+			ci.metrics.grpcMetrics.UnaryClientInterceptor(),
+			hnygrpc.UnaryClientInterceptor(),
+		),
 	)
 }
 

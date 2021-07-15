@@ -48,9 +48,6 @@ func certNames(cert *x509.Certificate) []string {
 	}
 	names = append(names, cert.DNSNames...)
 	names = core.UniqueLowerNames(names)
-	for i, n := range names {
-		names[i] = replaceInvalidUTF8([]byte(n))
-	}
 	return names
 }
 

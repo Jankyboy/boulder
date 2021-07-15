@@ -44,7 +44,7 @@ var ctx = context.Background()
 func initSA(t *testing.T) (*SQLStorageAuthority, clock.FakeClock, func()) {
 	features.Reset()
 
-	dbMap, err := NewDbMap(vars.DBConnSA, 0)
+	dbMap, err := NewDbMap(vars.DBConnSA, DbSettings{})
 	if err != nil {
 		t.Fatalf("Failed to create dbMap: %s", err)
 	}
@@ -86,16 +86,19 @@ func createPendingAuthorization(t *testing.T, sa core.StorageAuthority, domain s
 	return ids.Ids[0]
 }
 
-func createFinalizedAuthorization(t *testing.T, sa core.StorageAuthority, domain string, exp time.Time, status string) int64 {
+func createFinalizedAuthorization(t *testing.T, sa core.StorageAuthority, domain string, exp time.Time,
+	status string, attemptedAt time.Time) int64 {
 	t.Helper()
 	pendingID := createPendingAuthorization(t, sa, domain, exp)
 	expInt := exp.UnixNano()
 	attempted := string(core.ChallengeTypeHTTP01)
+	attemptedAtInt := attemptedAt.UnixNano()
 	err := sa.FinalizeAuthorization2(context.Background(), &sapb.FinalizeAuthorizationRequest{
-		Id:        pendingID,
-		Status:    status,
-		Expires:   expInt,
-		Attempted: attempted,
+		Id:          pendingID,
+		Status:      status,
+		Expires:     expInt,
+		Attempted:   attempted,
+		AttemptedAt: attemptedAtInt,
 	})
 	test.AssertNotError(t, err, "sa.FinalizeAuthorizations2 failed")
 	return pendingID
@@ -134,14 +137,16 @@ func TestAddRegistration(t *testing.T) {
 	dbReg, err := sa.GetRegistration(ctx, reg.ID)
 	test.AssertNotError(t, err, fmt.Sprintf("Couldn't get registration with ID %v", reg.ID))
 
+	createdAt := clk.Now()
 	expectedReg := core.Registration{
 		ID:        reg.ID,
 		Key:       jwk,
 		InitialIP: net.ParseIP("43.34.43.34"),
-		CreatedAt: clk.Now(),
+		CreatedAt: &createdAt,
 	}
 	test.AssertEquals(t, dbReg.ID, expectedReg.ID)
 	test.Assert(t, core.KeyDigestEquals(dbReg.Key, expectedReg.Key), "Stored key != expected")
+	test.AssertDeepEquals(t, expectedReg.CreatedAt, dbReg.CreatedAt)
 
 	newReg := core.Registration{
 		ID:        reg.ID,
@@ -170,20 +175,14 @@ func TestNoSuchRegistrationErrors(t *testing.T) {
 	defer cleanUp()
 
 	_, err := sa.GetRegistration(ctx, 100)
-	if !berrors.Is(err, berrors.NotFound) {
-		t.Errorf("GetRegistration: expected a berrors.NotFound type error, got %T type error (%s)", err, err)
-	}
+	test.AssertErrorIs(t, err, berrors.NotFound)
 
 	jwk := satest.GoodJWK()
 	_, err = sa.GetRegistrationByKey(ctx, jwk)
-	if !berrors.Is(err, berrors.NotFound) {
-		t.Errorf("GetRegistrationByKey: expected a berrors.NotFound type error, got %T type error (%s)", err, err)
-	}
+	test.AssertErrorIs(t, err, berrors.NotFound)
 
 	err = sa.UpdateRegistration(ctx, core.Registration{ID: 100, Key: jwk})
-	if !berrors.Is(err, berrors.NotFound) {
-		t.Errorf("UpdateRegistration: expected a berrors.NotFound type error, got %T type error (%v)", err, err)
-	}
+	test.AssertErrorIs(t, err, berrors.NotFound)
 }
 
 func TestAddCertificate(t *testing.T) {
@@ -234,6 +233,23 @@ func TestAddCertificate(t *testing.T) {
 	ocspResp := []byte{0, 0, 1}
 	_, err = sa.AddCertificate(ctx, certDER3, reg.ID, ocspResp, &issuedTime)
 	test.AssertNotError(t, err, "Couldn't add test-cert2.der")
+}
+
+func TestAddCertificateDuplicate(t *testing.T) {
+	sa, clk, cleanUp := initSA(t)
+	defer cleanUp()
+
+	reg := satest.CreateWorkingRegistration(t, sa)
+
+	_, testCert := test.ThrowAwayCert(t, 1)
+
+	issuedTime := clk.Now()
+	_, err := sa.AddCertificate(ctx, testCert.Raw, reg.ID, nil, &issuedTime)
+	test.AssertNotError(t, err, "Couldn't add test certificate")
+
+	_, err = sa.AddCertificate(ctx, testCert.Raw, reg.ID, nil, &issuedTime)
+	test.AssertDeepEquals(t, err, berrors.DuplicateError("cannot add a duplicate cert"))
+
 }
 
 func TestCountCertificatesByNames(t *testing.T) {
@@ -685,12 +701,13 @@ func TestDeactivateAuthorization2(t *testing.T) {
 
 	// deactivate a pending authorization
 	expires := fc.Now().Add(time.Hour).UTC()
+	attemptedAt := fc.Now()
 	authzID := createPendingAuthorization(t, sa, "example.com", expires)
 	_, err := sa.DeactivateAuthorization2(context.Background(), &sapb.AuthorizationID2{Id: authzID})
 	test.AssertNotError(t, err, "sa.DeactivateAuthorization2 failed")
 
 	// deactivate a valid authorization"
-	authzID = createFinalizedAuthorization(t, sa, "example.com", expires, "valid")
+	authzID = createFinalizedAuthorization(t, sa, "example.com", expires, "valid", attemptedAt)
 	_, err = sa.DeactivateAuthorization2(context.Background(), &sapb.AuthorizationID2{Id: authzID})
 	test.AssertNotError(t, err, "sa.DeactivateAuthorization2 failed")
 }
@@ -962,9 +979,10 @@ func TestSetOrderProcessing(t *testing.T) {
 	})
 	test.AssertNotError(t, err, "Couldn't create test registration")
 
-	// Add one pending authz
+	// Add one valid authz
 	expires := fc.Now().Add(time.Hour)
-	authzID := createFinalizedAuthorization(t, sa, "example.com", expires, "valid")
+	attemptedAt := fc.Now()
+	authzID := createFinalizedAuthorization(t, sa, "example.com", expires, "valid", attemptedAt)
 
 	order := &corepb.Order{
 		RegistrationID:   reg.ID,
@@ -993,9 +1011,7 @@ func TestSetOrderProcessing(t *testing.T) {
 	// Try to set the same order to be processing again. We should get an error.
 	err = sa.SetOrderProcessing(context.Background(), order)
 	test.AssertError(t, err, "Set the same order processing twice. This should have been an error.")
-	if !berrors.Is(err, berrors.OrderNotReady) {
-		t.Errorf("Wrong error when setting an order to processing twice. Expected OrderNotReady, got %#v", err)
-	}
+	test.AssertErrorIs(t, err, berrors.OrderNotReady)
 }
 
 func TestFinalizeOrder(t *testing.T) {
@@ -1009,9 +1025,10 @@ func TestFinalizeOrder(t *testing.T) {
 	})
 	test.AssertNotError(t, err, "Couldn't create test registration")
 
-	// Add one pending authz
+	// Add one valid authz
 	expires := fc.Now().Add(time.Hour)
-	authzID := createFinalizedAuthorization(t, sa, "example.com", expires, "valid")
+	attemptedAt := fc.Now()
+	authzID := createFinalizedAuthorization(t, sa, "example.com", expires, "valid", attemptedAt)
 
 	order := &corepb.Order{
 		RegistrationID:   reg.ID,
@@ -1107,7 +1124,7 @@ func TestGetAuthorizationNoRows(t *testing.T) {
 	id := int64(123)
 	_, err := sa.GetAuthorization2(ctx, &sapb.AuthorizationID2{Id: id})
 	test.AssertError(t, err, "Didn't get an error looking up non-existent authz ID")
-	test.Assert(t, berrors.Is(err, berrors.NotFound), "GetAuthorization did not return a berrors.NotFound error")
+	test.AssertErrorIs(t, err, berrors.NotFound)
 }
 
 func TestGetAuthorizations2(t *testing.T) {
@@ -1116,6 +1133,7 @@ func TestGetAuthorizations2(t *testing.T) {
 
 	reg := satest.CreateWorkingRegistration(t, sa)
 	exp := fc.Now().AddDate(0, 0, 10).UTC()
+	attemptedAt := fc.Now()
 
 	identA := "aaa"
 	identB := "bbb"
@@ -1123,7 +1141,7 @@ func TestGetAuthorizations2(t *testing.T) {
 	identD := "ddd"
 	idents := []string{identA, identB, identC}
 
-	authzIDA := createFinalizedAuthorization(t, sa, "aaa", exp, "valid")
+	authzIDA := createFinalizedAuthorization(t, sa, "aaa", exp, "valid", attemptedAt)
 	authzIDB := createPendingAuthorization(t, sa, "bbb", exp)
 	nearbyExpires := fc.Now().UTC().Add(time.Hour)
 	authzIDC := createPendingAuthorization(t, sa, "ccc", nearbyExpires)
@@ -1289,7 +1307,7 @@ func TestGetOrderForNames(t *testing.T) {
 	// We expect the result to return an error
 	test.AssertError(t, err, "sa.GetOrderForNames did not return an error for an empty result")
 	// The error should be a notfound error
-	test.AssertEquals(t, berrors.Is(err, berrors.NotFound), true)
+	test.AssertErrorIs(t, err, berrors.NotFound)
 	// The result should be nil
 	test.Assert(t, result == nil, "sa.GetOrderForNames for non-existent order returned non-nil result")
 
@@ -1326,7 +1344,7 @@ func TestGetOrderForNames(t *testing.T) {
 	// It should error
 	test.AssertError(t, err, "sa.GetOrderForNames did not return an error for an empty result")
 	// The error should be a notfound error
-	test.AssertEquals(t, berrors.Is(err, berrors.NotFound), true)
+	test.AssertErrorIs(t, err, berrors.NotFound)
 	// The result should be nil
 	test.Assert(t, result == nil, "sa.GetOrderForNames for diff AcctID returned non-nil result")
 
@@ -1342,15 +1360,16 @@ func TestGetOrderForNames(t *testing.T) {
 	// It should error since there is no result
 	test.AssertError(t, err, "sa.GetOrderForNames did not return an error for an empty result")
 	// The error should be a notfound error
-	test.AssertEquals(t, berrors.Is(err, berrors.NotFound), true)
+	test.AssertErrorIs(t, err, berrors.NotFound)
 	// The result should be nil because the initial order expired & we don't want
 	// to return expired orders
 	test.Assert(t, result == nil, "sa.GetOrderForNames returned non-nil result for expired order case")
 
 	// Create two valid authorizations
 	authzExpires = fc.Now().Add(time.Hour)
-	authzIDC := createFinalizedAuthorization(t, sa, "zombo.com", authzExpires, "valid")
-	authzIDD := createFinalizedAuthorization(t, sa, "welcome.to.zombo.com", authzExpires, "valid")
+	attemptedAt := fc.Now()
+	authzIDC := createFinalizedAuthorization(t, sa, "zombo.com", authzExpires, "valid", attemptedAt)
+	authzIDD := createFinalizedAuthorization(t, sa, "welcome.to.zombo.com", authzExpires, "valid", attemptedAt)
 
 	// Add a fresh order that uses the authorizations created above
 	names = []string{"zombo.com", "welcome.to.zombo.com"}
@@ -1395,7 +1414,7 @@ func TestGetOrderForNames(t *testing.T) {
 	// It should error since a valid order should not be reused.
 	test.AssertError(t, err, "sa.GetOrderForNames did not return an error for an empty result")
 	// The error should be a notfound error
-	test.AssertEquals(t, berrors.Is(err, berrors.NotFound), true)
+	test.AssertErrorIs(t, err, berrors.NotFound)
 	// The result should be nil because the one matching order has been finalized
 	// already
 	test.Assert(t, result == nil, "sa.GetOrderForNames returned non-nil result for finalized order case")
@@ -1409,6 +1428,7 @@ func TestStatusForOrder(t *testing.T) {
 	expires := fc.Now().Add(time.Hour)
 	expiresNano := expires.UnixNano()
 	alreadyExpired := expires.Add(-2 * time.Hour)
+	attemptedAt := fc.Now()
 
 	// Create a registration to work with
 	reg := satest.CreateWorkingRegistration(t, sa)
@@ -1417,8 +1437,8 @@ func TestStatusForOrder(t *testing.T) {
 	// and a valid authz
 	pendingID := createPendingAuthorization(t, sa, "pending.your.order.is.up", expires)
 	expiredID := createPendingAuthorization(t, sa, "expired.your.order.is.up", alreadyExpired)
-	invalidID := createFinalizedAuthorization(t, sa, "invalid.your.order.is.up", expires, "invalid")
-	validID := createFinalizedAuthorization(t, sa, "valid.your.order.is.up", expires, "valid")
+	invalidID := createFinalizedAuthorization(t, sa, "invalid.your.order.is.up", expires, "invalid", attemptedAt)
+	validID := createFinalizedAuthorization(t, sa, "valid.your.order.is.up", expires, "valid", attemptedAt)
 	deactivatedID := createPendingAuthorization(t, sa, "deactivated.your.order.is.up", expires)
 	_, err := sa.DeactivateAuthorization2(context.Background(), &sapb.AuthorizationID2{Id: deactivatedID})
 	test.AssertNotError(t, err, "sa.DeactivateAuthorization2 failed")
@@ -1537,9 +1557,10 @@ func TestUpdateChallengesDeleteUnused(t *testing.T) {
 
 	expires := fc.Now().Add(time.Hour)
 	ctx := context.Background()
+	attemptedAt := fc.Now()
 
-	// Create a pending authz
-	authzID := createFinalizedAuthorization(t, sa, "example.com", expires, "valid")
+	// Create a valid authz
+	authzID := createFinalizedAuthorization(t, sa, "example.com", expires, "valid", attemptedAt)
 
 	result, err := sa.GetAuthorization2(ctx, &sapb.AuthorizationID2{Id: authzID})
 	test.AssertNotError(t, err, "sa.GetAuthorization2 failed")
@@ -1685,37 +1706,6 @@ func TestAddCertificateRenewalBit(t *testing.T) {
 	for _, name := range names {
 		assertIsRenewal(t, name, false)
 	}
-}
-
-func TestAddCertificateBadRatelimitUpdate(t *testing.T) {
-	sa, _, cleanUp := initSA(t)
-	defer cleanUp()
-
-	reg := satest.CreateWorkingRegistration(t, sa)
-	issued := sa.clk.Now()
-	serial, cert := test.ThrowAwayCert(t, 1)
-
-	// Manually add an fqdn set for the certificate serial. This will cause the
-	// real fqdn set update in AddCertificate to fail due to the duplicate serial.
-	err := addFQDNSet(
-		sa.dbMap,
-		cert.DNSNames,
-		serial,
-		cert.NotBefore,
-		cert.NotAfter)
-	test.AssertNotError(t, err, "Couldn't manually add fqdnSet")
-
-	// Add the test certificate, it shouldn't error even though part of the rate
-	// limit updates failed.
-	_, err = sa.AddCertificate(ctx, cert.Raw, reg.ID, nil, &issued)
-	test.AssertNotError(t, err, "Couldn't add testCert")
-
-	// The rate limit transaction failure stat should have been incremented
-	test.AssertEquals(t, test.CountCounter(sa.rateLimitWriteErrors), 1)
-
-	// The rate limit transaction failure should have been audit logged
-	logLines := log.GetAllMatching(`ERR: \[AUDIT\] failed AddCertificate ratelimit update transaction: failed to insert \*core.FQDNSet: Error 1062: Duplicate entry '.*' for key 'serial'`)
-	test.AssertEquals(t, len(logLines), 1)
 }
 
 func TestCountCertificatesRenewalBit(t *testing.T) {
@@ -1868,7 +1858,10 @@ func TestFinalizeAuthorization2(t *testing.T) {
 	ids, err := sa.NewAuthorizations2(context.Background(), &sapb.AddPendingAuthorizationsRequest{Authz: []*corepb.Authorization{apb}})
 	test.AssertNotError(t, err, "sa.NewAuthorization failed")
 
+	fc.Set(time.Date(2021, 1, 1, 0, 0, 0, 0, time.UTC))
 	expires = fc.Now().Add(time.Hour * 2).UTC().UnixNano()
+	attemptedAt := fc.Now().UnixNano()
+
 	ip, _ := net.ParseIP("1.1.1.1").MarshalText()
 	err = sa.FinalizeAuthorization2(context.Background(), &sapb.FinalizeAuthorizationRequest{
 		Id: ids.Ids[0],
@@ -1880,9 +1873,10 @@ func TestFinalizeAuthorization2(t *testing.T) {
 				AddressUsed: ip,
 			},
 		},
-		Status:    string(core.StatusValid),
-		Expires:   expires,
-		Attempted: string(core.ChallengeTypeDNS01),
+		Status:      string(core.StatusValid),
+		Expires:     expires,
+		Attempted:   string(core.ChallengeTypeDNS01),
+		AttemptedAt: attemptedAt,
 	})
 	test.AssertNotError(t, err, "sa.FinalizeAuthorization2 failed")
 
@@ -1892,6 +1886,7 @@ func TestFinalizeAuthorization2(t *testing.T) {
 	test.AssertEquals(t, time.Unix(0, dbVer.Expires).UTC(), fc.Now().Add(time.Hour*2).UTC())
 	test.AssertEquals(t, dbVer.Challenges[0].Status, string(core.StatusValid))
 	test.AssertEquals(t, len(dbVer.Challenges[0].Validationrecords), 1)
+	test.AssertEquals(t, time.Unix(0, dbVer.Challenges[0].Validated).UTC(), fc.Now().UTC())
 
 	apb2 := &corepb.Authorization{
 		Identifier:     "aaa",
@@ -2080,8 +2075,10 @@ func TestGetValidOrderAuthorizations2(t *testing.T) {
 	identA := "a.example.com"
 	identB := "b.example.com"
 	expires := fc.Now().Add(time.Hour * 24 * 7).UTC()
-	authzIDA := createFinalizedAuthorization(t, sa, identA, expires, "valid")
-	authzIDB := createFinalizedAuthorization(t, sa, identB, expires, "valid")
+	attemptedAt := fc.Now()
+
+	authzIDA := createFinalizedAuthorization(t, sa, identA, expires, "valid", attemptedAt)
+	authzIDB := createFinalizedAuthorization(t, sa, identB, expires, "valid", attemptedAt)
 
 	order, err := sa.NewOrder(context.Background(), &corepb.Order{
 		RegistrationID:   reg.ID,
@@ -2145,7 +2142,8 @@ func TestCountInvalidAuthorizations2(t *testing.T) {
 	ident := "aaa"
 	expiresA := fc.Now().Add(time.Hour).UTC()
 	expiresB := fc.Now().Add(time.Hour * 3).UTC()
-	_ = createFinalizedAuthorization(t, sa, ident, expiresA, "invalid")
+	attemptedAt := fc.Now()
+	_ = createFinalizedAuthorization(t, sa, ident, expiresA, "invalid", attemptedAt)
 	_ = createPendingAuthorization(t, sa, ident, expiresB)
 
 	earliest, latest := fc.Now().Add(-time.Hour).UTC().UnixNano(), fc.Now().Add(time.Hour*5).UTC().UnixNano()
@@ -2168,7 +2166,8 @@ func TestGetValidAuthorizations2(t *testing.T) {
 	// Create a valid authorization
 	ident := "aaa"
 	expires := fc.Now().Add(time.Hour).UTC()
-	authzID := createFinalizedAuthorization(t, sa, ident, expires, "valid")
+	attemptedAt := fc.Now()
+	authzID := createFinalizedAuthorization(t, sa, ident, expires, "valid", attemptedAt)
 
 	now := fc.Now().UTC().UnixNano()
 	regID := int64(1)
@@ -2203,7 +2202,7 @@ func TestGetOrderExpired(t *testing.T) {
 		Id: order.Id,
 	})
 	test.AssertError(t, err, "GetOrder didn't fail for an expired order")
-	test.Assert(t, berrors.Is(err, berrors.NotFound), "GetOrder error wasn't of type NotFound")
+	test.AssertErrorIs(t, err, berrors.NotFound)
 }
 
 func TestBlockedKey(t *testing.T) {

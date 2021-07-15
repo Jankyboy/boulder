@@ -52,11 +52,13 @@ func TestChallenge(t *testing.T) {
 	var jwk jose.JSONWebKey
 	err := json.Unmarshal([]byte(JWK1JSON), &jwk)
 	test.AssertNotError(t, err, "Failed to unmarshal test key")
+	validated := time.Now().Round(0).UTC()
 	chall := core.Challenge{
 		Type:                     core.ChallengeTypeDNS01,
-		Status:                   core.StatusPending,
+		Status:                   core.StatusValid,
 		Token:                    "asd",
 		ProvidedKeyAuthorization: "keyauth",
+		Validated:                &validated,
 	}
 
 	pb, err := ChallengeToPB(chall)
@@ -157,35 +159,36 @@ func TestRegistration(t *testing.T) {
 		}
 	`), &key)
 	test.AssertNotError(t, err, "Could not unmarshal testing key")
+	createdAt := time.Now().Round(0).UTC()
 	inReg := core.Registration{
 		ID:        1,
 		Key:       &key,
 		Contact:   &contacts,
 		Agreement: "yup",
 		InitialIP: net.ParseIP("1.1.1.1"),
-		CreatedAt: time.Now().Round(0),
+		CreatedAt: &createdAt,
 		Status:    core.StatusValid,
 	}
-	pbReg, err := registrationToPB(inReg)
+	pbReg, err := RegistrationToPB(inReg)
 	test.AssertNotError(t, err, "registrationToPB failed")
-	outReg, err := pbToRegistration(pbReg)
-	test.AssertNotError(t, err, "pbToRegistration failed")
+	outReg, err := PbToRegistration(pbReg)
+	test.AssertNotError(t, err, "PbToRegistration failed")
 	test.AssertDeepEquals(t, inReg, outReg)
 
 	inReg.Contact = nil
-	pbReg, err = registrationToPB(inReg)
+	pbReg, err = RegistrationToPB(inReg)
 	test.AssertNotError(t, err, "registrationToPB failed")
 	pbReg.Contact = []string{}
-	outReg, err = pbToRegistration(pbReg)
-	test.AssertNotError(t, err, "pbToRegistration failed")
+	outReg, err = PbToRegistration(pbReg)
+	test.AssertNotError(t, err, "PbToRegistration failed")
 	test.AssertDeepEquals(t, inReg, outReg)
 
 	var empty []string
 	inReg.Contact = &empty
-	pbReg, err = registrationToPB(inReg)
+	pbReg, err = RegistrationToPB(inReg)
 	test.AssertNotError(t, err, "registrationToPB failed")
-	outReg, err = pbToRegistration(pbReg)
-	test.AssertNotError(t, err, "pbToRegistration failed")
+	outReg, err = PbToRegistration(pbReg)
+	test.AssertNotError(t, err, "PbToRegistration failed")
 	test.Assert(t, *outReg.Contact != nil, "Empty slice was converted to a nil slice")
 }
 

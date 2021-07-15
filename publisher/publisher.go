@@ -10,6 +10,7 @@ import (
 	"encoding/asn1"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math/big"
 	"net/http"
@@ -26,6 +27,7 @@ import (
 
 	"github.com/letsencrypt/boulder/canceled"
 	"github.com/letsencrypt/boulder/core"
+	"github.com/letsencrypt/boulder/issuance"
 	blog "github.com/letsencrypt/boulder/log"
 	"github.com/letsencrypt/boulder/metrics"
 	pubpb "github.com/letsencrypt/boulder/publisher/proto"
@@ -164,6 +166,7 @@ type ctSubmissionRequest struct {
 type pubMetrics struct {
 	submissionLatency *prometheus.HistogramVec
 	probeLatency      *prometheus.HistogramVec
+	errorCount        *prometheus.CounterVec
 }
 
 func initMetrics(stats prometheus.Registerer) *pubMetrics {
@@ -187,32 +190,39 @@ func initMetrics(stats prometheus.Registerer) *pubMetrics {
 	)
 	stats.MustRegister(probeLatency)
 
-	return &pubMetrics{
-		submissionLatency: submissionLatency,
-		probeLatency:      probeLatency,
-	}
+	errorCount := prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "ct_errors_count",
+			Help: "Count of errors by type",
+		},
+		[]string{"type"},
+	)
+	stats.MustRegister(errorCount)
+
+	return &pubMetrics{submissionLatency, probeLatency, errorCount}
 }
 
 // Impl defines a Publisher
 type Impl struct {
-	log          blog.Logger
-	userAgent    string
-	issuerBundle []ct.ASN1Cert
-	ctLogsCache  logCache
-	metrics      *pubMetrics
+	pubpb.UnimplementedPublisherServer
+	log           blog.Logger
+	userAgent     string
+	issuerBundles map[issuance.IssuerNameID][]ct.ASN1Cert
+	ctLogsCache   logCache
+	metrics       *pubMetrics
 }
 
 // New creates a Publisher that will submit certificates
 // to requested CT logs
 func New(
-	bundle []ct.ASN1Cert,
+	bundles map[issuance.IssuerNameID][]ct.ASN1Cert,
 	userAgent string,
 	logger blog.Logger,
 	stats prometheus.Registerer,
 ) *Impl {
 	return &Impl{
-		issuerBundle: bundle,
-		userAgent:    userAgent,
+		issuerBundles: bundles,
+		userAgent:     userAgent,
 		ctLogsCache: logCache{
 			logs: make(map[string]*Log),
 		},
@@ -229,8 +239,15 @@ func (pub *Impl) SubmitToSingleCTWithResult(ctx context.Context, req *pubpb.Requ
 		pub.log.AuditErrf("Failed to parse certificate: %s", err)
 		return nil, err
 	}
-
-	chain := append([]ct.ASN1Cert{{Data: req.Der}}, pub.issuerBundle...)
+	chain := []ct.ASN1Cert{{Data: req.Der}}
+	id := issuance.GetIssuerNameID(cert)
+	issuerBundle, ok := pub.issuerBundles[id]
+	if !ok {
+		err := fmt.Errorf("No issuerBundle matching issuerNameID: %d", int64(id))
+		pub.log.AuditErrf("Failed to submit certificate to CT log: %s", err)
+		return nil, err
+	}
+	chain = append(chain, issuerBundle...)
 
 	// Add a log URL/pubkey to the cache, if already present the
 	// existing *Log will be returned, otherwise one will be constructed, added
@@ -254,8 +271,9 @@ func (pub *Impl) SubmitToSingleCTWithResult(ctx context.Context, req *pubpb.Requ
 			return nil, err
 		}
 		var body string
-		if respErr, ok := err.(jsonclient.RspError); ok && respErr.StatusCode < 500 {
-			body = string(respErr.Body)
+		var rspErr jsonclient.RspError
+		if errors.As(err, &rspErr) && rspErr.StatusCode < 500 {
+			body = string(rspErr.Body)
 		}
 		pub.log.AuditErrf("Failed to submit certificate to CT log at %s: %s Body=%q",
 			ctLog.uri, err, body)
@@ -291,7 +309,8 @@ func (pub *Impl) singleLogSubmit(
 			status = "canceled"
 		}
 		httpStatus := ""
-		if rspError, ok := err.(ctClient.RspError); ok && rspError.StatusCode != 0 {
+		var rspError ctClient.RspError
+		if errors.As(err, &rspError) && rspError.StatusCode != 0 {
 			httpStatus = fmt.Sprintf("%d", rspError.StatusCode)
 		}
 		pub.metrics.submissionLatency.With(prometheus.Labels{
@@ -299,6 +318,11 @@ func (pub *Impl) singleLogSubmit(
 			"status":      status,
 			"http_status": httpStatus,
 		}).Observe(took)
+		if isPrecert {
+			pub.metrics.errorCount.WithLabelValues("precert").Inc()
+		} else {
+			pub.metrics.errorCount.WithLabelValues("final").Inc()
+		}
 		return nil, err
 	}
 	pub.metrics.submissionLatency.With(prometheus.Labels{
@@ -382,4 +406,15 @@ func CreateTestingSignedSCT(req []string, k *ecdsa.PrivateKey, precert bool, tim
 
 	jsonSCT, _ := json.Marshal(jsonSCTObj)
 	return jsonSCT
+}
+
+// GetCTBundleForChain takes a slice of *issuance.Certificate(s)
+// representing a certificate chain and returns a slice of
+// ct.ANS1Cert(s) in the same order
+func GetCTBundleForChain(chain []*issuance.Certificate) []ct.ASN1Cert {
+	var ctBundle []ct.ASN1Cert
+	for _, cert := range chain {
+		ctBundle = append(ctBundle, ct.ASN1Cert{Data: cert.Raw})
+	}
+	return ctBundle
 }

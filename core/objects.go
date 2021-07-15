@@ -137,7 +137,7 @@ type Registration struct {
 	InitialIP net.IP `json:"initialIp"`
 
 	// CreatedAt is the time the registration was created.
-	CreatedAt time.Time `json:"createdAt"`
+	CreatedAt *time.Time `json:"createdAt,omitempty"`
 
 	Status AcmeStatus `json:"status"`
 }
@@ -219,6 +219,9 @@ type Challenge struct {
 	// Contains information about URLs used or redirected to and IPs resolved and
 	// used
 	ValidationRecord []ValidationRecord `json:"validationRecord,omitempty"`
+	// The time at which the server validated the challenge. Required by
+	// RFC8555 if status is valid.
+	Validated *time.Time `json:"validated,omitempty"`
 }
 
 // ExpectedKeyAuthorization computes the expected KeyAuthorization value for
@@ -432,12 +435,6 @@ func (jb *JSONBuffer) UnmarshalJSON(data []byte) (err error) {
 	return
 }
 
-// Precertificate objects are entirely internal to the server.  The only
-// thing exposed on the wire is the precertificate itself.
-type Precertificate struct {
-	DER []byte `db:"der"`
-}
-
 // Certificate objects are entirely internal to the server.  The only
 // thing exposed on the wire is the certificate itself.
 type Certificate struct {
@@ -493,68 +490,8 @@ type CertificateStatus struct {
 	NotAfter  time.Time `db:"notAfter"`
 	IsExpired bool      `db:"isExpired"`
 
+	// TODO(#5152): Replace IssuerID with IssuerNameID.
 	IssuerID *int64
-}
-
-// OCSPResponse is a (large) table of OCSP responses. This contains all
-// historical OCSP responses we've signed, is append-only, and is likely to get
-// quite large.
-// It must be administratively truncated outside of Boulder.
-type OCSPResponse struct {
-	ID int `db:"id"`
-
-	// serial: Same as certificate serial.
-	Serial string `db:"serial"`
-
-	// createdAt: The date the response was signed.
-	CreatedAt time.Time `db:"createdAt"`
-
-	// response: The encoded and signed CRL.
-	Response []byte `db:"response"`
-}
-
-// CRL is a large table of signed CRLs. This contains all historical CRLs
-// we've signed, is append-only, and is likely to get quite large.
-// It must be administratively truncated outside of Boulder.
-type CRL struct {
-	// serial: Same as certificate serial.
-	Serial string `db:"serial"`
-
-	// createdAt: The date the CRL was signed.
-	CreatedAt time.Time `db:"createdAt"`
-
-	// crl: The encoded and signed CRL.
-	CRL string `db:"crl"`
-}
-
-// OCSPSigningRequest is a transfer object representing an OCSP Signing Request
-type OCSPSigningRequest struct {
-	CertDER   []byte
-	Status    string
-	Reason    revocation.Reason
-	RevokedAt time.Time
-}
-
-// SignedCertificateTimestamp is the internal representation of ct.SignedCertificateTimestamp
-// that is used to maintain backwards compatibility with our old CT implementation.
-type SignedCertificateTimestamp struct {
-	ID int `db:"id"`
-	// The version of the protocol to which the SCT conforms
-	SCTVersion uint8 `db:"sctVersion"`
-	// the SHA-256 hash of the log's public key, calculated over
-	// the DER encoding of the key represented as SubjectPublicKeyInfo.
-	LogID string `db:"logID"`
-	// Timestamp (in ms since unix epoc) at which the SCT was issued
-	Timestamp uint64 `db:"timestamp"`
-	// For future extensions to the protocol
-	Extensions []byte `db:"extensions"`
-	// The Log's signature for this SCT
-	Signature []byte `db:"signature"`
-
-	// The serial of the certificate this SCT is for
-	CertificateSerial string `db:"certificateSerial"`
-
-	LockCol int64
 }
 
 // FQDNSet contains the SHA256 hash of the lowercased, comma joined dNSNames
@@ -565,18 +502,6 @@ type FQDNSet struct {
 	Serial  string
 	Issued  time.Time
 	Expires time.Time
-}
-
-// Order represents the request object that forms the basis of the v2 style
-// issuance flow
-type Order struct {
-	ID                int64
-	RegistrationID    int64
-	Expires           time.Time
-	Error             error
-	CertificateSerial string
-	Authorizations    []Authorization
-	Status            AcmeStatus
 }
 
 // SCTDERs is a convenience type

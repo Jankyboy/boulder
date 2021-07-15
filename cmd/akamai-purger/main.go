@@ -9,10 +9,15 @@ import (
 	"sync"
 	"time"
 
+	"github.com/honeycombio/beeline-go"
+	"github.com/prometheus/client_golang/prometheus"
+	"google.golang.org/grpc/health"
+	healthpb "google.golang.org/grpc/health/grpc_health_v1"
+	"google.golang.org/protobuf/types/known/emptypb"
+
 	"github.com/letsencrypt/boulder/akamai"
 	akamaipb "github.com/letsencrypt/boulder/akamai/proto"
 	"github.com/letsencrypt/boulder/cmd"
-	corepb "github.com/letsencrypt/boulder/core/proto"
 	bgrpc "github.com/letsencrypt/boulder/grpc"
 	blog "github.com/letsencrypt/boulder/log"
 )
@@ -32,10 +37,12 @@ type config struct {
 		PurgeRetries      int
 		PurgeRetryBackoff cmd.ConfigDuration
 	}
-	Syslog cmd.SyslogConfig
+	Syslog  cmd.SyslogConfig
+	Beeline cmd.BeelineConfig
 }
 
 type akamaiPurger struct {
+	akamaipb.UnimplementedAkamaiPurgerServer
 	mu      sync.Mutex
 	toPurge []string
 
@@ -73,14 +80,14 @@ func (ap *akamaiPurger) purge() error {
 // >= the number of URLs to purge so that it can catch up.
 var maxQueueSize = 1000000
 
-func (ap *akamaiPurger) Purge(ctx context.Context, req *akamaipb.PurgeRequest) (*corepb.Empty, error) {
+func (ap *akamaiPurger) Purge(ctx context.Context, req *akamaipb.PurgeRequest) (*emptypb.Empty, error) {
 	ap.mu.Lock()
 	defer ap.mu.Unlock()
 	if len(ap.toPurge) >= maxQueueSize {
 		return nil, errors.New("Akamai purge queue too large")
 	}
 	ap.toPurge = append(ap.toPurge, req.Urls...)
-	return &corepb.Empty{}, nil
+	return &emptypb.Empty{}, nil
 }
 
 func main() {
@@ -103,6 +110,11 @@ func main() {
 	if *debugAddr != "" {
 		c.AkamaiPurger.DebugAddr = *debugAddr
 	}
+
+	bc, err := c.Beeline.Load()
+	cmd.FailOnError(err, "Failed to load Beeline config")
+	beeline.Init(bc)
+	defer beeline.Close()
 
 	scope, logger := cmd.StatsAndLogging(c.Syslog, c.AkamaiPurger.DebugAddr)
 	defer logger.AuditPanic()
@@ -134,6 +146,15 @@ func main() {
 		client: ccu,
 		log:    logger,
 	}
+
+	var gaugePurgeQueueLength = prometheus.NewGaugeFunc(
+		prometheus.GaugeOpts{
+			Name: "ccu_purge_queue_length",
+			Help: "The length of the akamai-purger queue. Captured on each prometheus scrape.",
+		},
+		func() float64 { return float64(ap.len()) },
+	)
+	scope.MustRegister(gaugePurgeQueueLength)
 
 	stop, stopped := make(chan bool, 1), make(chan bool, 1)
 	ticker := time.NewTicker(c.AkamaiPurger.PurgeInterval.Duration)
@@ -168,8 +189,11 @@ func main() {
 	grpcSrv, l, err := bgrpc.NewServer(c.AkamaiPurger.GRPC, tlsConfig, serverMetrics, clk)
 	cmd.FailOnError(err, "Unable to setup Akamai purger gRPC server")
 	akamaipb.RegisterAkamaiPurgerServer(grpcSrv, &ap)
+	hs := health.NewServer()
+	healthpb.RegisterHealthServer(grpcSrv, hs)
 
 	go cmd.CatchSignals(logger, func() {
+		hs.Shutdown()
 		grpcSrv.GracefulStop()
 		// Stop the ticker and signal that we want to shutdown by writing to the
 		// stop channel. We wait 15 seconds for any remaining URLs to be emptied

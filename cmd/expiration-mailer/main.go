@@ -17,6 +17,7 @@ import (
 	"text/template"
 	"time"
 
+	"github.com/honeycombio/beeline-go"
 	"github.com/jmhodges/clock"
 
 	"github.com/letsencrypt/boulder/cmd"
@@ -363,7 +364,7 @@ func (ds durationSlice) Swap(a, b int) {
 type config struct {
 	Mailer struct {
 		cmd.ServiceConfig
-		cmd.DBConfig
+		DB cmd.DBConfig
 		cmd.SMTPConfig
 
 		From    string
@@ -390,7 +391,8 @@ type config struct {
 		Features map[string]bool
 	}
 
-	Syslog cmd.SyslogConfig
+	Syslog  cmd.SyslogConfig
+	Beeline cmd.BeelineConfig
 }
 
 func initStats(stats prometheus.Registerer) mailerStats {
@@ -462,6 +464,11 @@ func main() {
 	err = features.Set(c.Mailer.Features)
 	cmd.FailOnError(err, "Failed to set feature flags")
 
+	bc, err := c.Beeline.Load()
+	cmd.FailOnError(err, "Failed to load Beeline config")
+	beeline.Init(bc)
+	defer beeline.Close()
+
 	scope, logger := cmd.StatsAndLogging(c.Syslog, c.Mailer.DebugAddr)
 	defer logger.AuditPanic()
 	logger.Info(cmd.VersionString())
@@ -475,14 +482,20 @@ func main() {
 	}
 
 	// Configure DB
-	dbURL, err := c.Mailer.DBConfig.URL()
+	dbURL, err := c.Mailer.DB.URL()
 	cmd.FailOnError(err, "Couldn't load DB URL")
-	dbMap, err := sa.NewDbMap(dbURL, c.Mailer.DBConfig.MaxDBConns)
+	dbSettings := sa.DbSettings{
+		MaxOpenConns:    c.Mailer.DB.MaxOpenConns,
+		MaxIdleConns:    c.Mailer.DB.MaxIdleConns,
+		ConnMaxLifetime: c.Mailer.DB.ConnMaxLifetime.Duration,
+		ConnMaxIdleTime: c.Mailer.DB.ConnMaxIdleTime.Duration,
+	}
+	dbMap, err := sa.NewDbMap(dbURL, dbSettings)
 	cmd.FailOnError(err, "Could not connect to database")
 	sa.SetSQLDebug(dbMap, logger)
 
 	// Collect and periodically report DB metrics using the DBMap and prometheus scope.
-	sa.InitDBMetrics(dbMap, scope)
+	sa.InitDBMetrics(dbMap, scope, dbSettings)
 
 	tlsConfig, err := c.Mailer.TLS.Load()
 	cmd.FailOnError(err, "TLS config")

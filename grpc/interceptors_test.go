@@ -105,7 +105,9 @@ func TestFailFastFalse(t *testing.T) {
 
 // testServer is used to implement TestTimeouts, and will attempt to sleep for
 // the given amount of time (unless it hits a timeout or cancel).
-type testServer struct{}
+type testServer struct {
+	test_proto.UnimplementedChillerServer
+}
 
 // Chill implements ChillerServer.Chill
 func (s *testServer) Chill(ctx context.Context, in *test_proto.Time) (*test_proto.Time, error) {
@@ -229,8 +231,7 @@ func TestRequestTimeTagging(t *testing.T) {
 	}
 
 	// There should be one histogram sample in the serverInterceptor rpcLag stat
-	count := test.CountHistogramSamples(si.metrics.rpcLag)
-	test.AssertEquals(t, count, 1)
+	test.AssertMetricWithLabelsEquals(t, si.metrics.rpcLag, prometheus.Labels{}, 1)
 }
 
 // blockedServer implements a ChillerServer with a Chill method that:
@@ -239,6 +240,7 @@ func TestRequestTimeTagging(t *testing.T) {
 // This is used by TestInFlightRPCStat to test that the gauge for in-flight RPCs
 // is incremented and decremented as expected.
 type blockedServer struct {
+	test_proto.UnimplementedChillerServer
 	roadblock, received sync.WaitGroup
 }
 
@@ -322,11 +324,8 @@ func TestInFlightRPCStat(t *testing.T) {
 		"method":  "Chill",
 	}
 
-	// Retrieve the gauge for inflight Chiller.Chill RPCs
-	inFlightCount, err := test.GaugeValueWithLabels(ci.metrics.inFlightRPCs, labels)
-	test.AssertNotError(t, err, "Error collecting gauge value for inFlightRPCs")
 	// We expect the inFlightRPCs gauge for the Chiller.Chill RPCs to be equal to numRPCs.
-	test.AssertEquals(t, inFlightCount, numRPCs)
+	test.AssertMetricWithLabelsEquals(t, ci.metrics.inFlightRPCs, labels, float64(numRPCs))
 
 	// Unblock the blockedServer to let all of the Chiller.Chill RPCs complete
 	server.roadblock.Done()
@@ -334,9 +333,27 @@ func TestInFlightRPCStat(t *testing.T) {
 	time.Sleep(1 * time.Second)
 
 	// Check the gauge value again
-	inFlightCount, err = test.GaugeValueWithLabels(ci.metrics.inFlightRPCs, labels)
-	test.AssertNotError(t, err, "Error collecting gauge value for inFlightRPCs")
-	// There should now be zero in flight chill requests.
-	// What a ~ ~ Chill Sitch ~ ~
-	test.AssertEquals(t, inFlightCount, 0)
+	test.AssertMetricWithLabelsEquals(t, ci.metrics.inFlightRPCs, labels, 0)
+}
+
+func TestNoCancelInterceptor(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel2 := context.WithDeadline(ctx, time.Now().Add(time.Second))
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		select {
+		case <-ctx.Done():
+			return nil, errors.New("oh no canceled")
+		case <-time.After(50 * time.Millisecond):
+		}
+		return nil, nil
+	}
+	go func() {
+		time.Sleep(10 * time.Millisecond)
+		cancel()
+		cancel2()
+	}()
+	_, err := NoCancelInterceptor(ctx, nil, nil, handler)
+	if err != nil {
+		t.Error(err)
+	}
 }

@@ -6,6 +6,7 @@ import (
 	"io/ioutil"
 	"time"
 
+	"github.com/honeycombio/beeline-go"
 	"github.com/jmhodges/clock"
 	"github.com/letsencrypt/boulder/cmd"
 	"github.com/letsencrypt/boulder/db"
@@ -17,14 +18,16 @@ import (
 
 type config struct {
 	ExpiredAuthzPurger2 struct {
-		cmd.DBConfig
-		DebugAddr string
-		Syslog    cmd.SyslogConfig
-		Features  map[string]bool
-
 		GracePeriod  cmd.ConfigDuration
 		BatchSize    int
 		WaitDuration cmd.ConfigDuration
+
+		DB        cmd.DBConfig
+		DebugAddr string
+		Features  map[string]bool
+
+		Syslog  cmd.SyslogConfig
+		Beeline cmd.BeelineConfig
 	}
 }
 
@@ -63,6 +66,11 @@ func main() {
 	err = features.Set(c.ExpiredAuthzPurger2.Features)
 	cmd.FailOnError(err, "Failed to set feature flags")
 
+	bc, err := c.ExpiredAuthzPurger2.Beeline.Load()
+	cmd.FailOnError(err, "Failed to load Beeline config")
+	beeline.Init(bc)
+	defer beeline.Close()
+
 	var logger blog.Logger
 	if c.ExpiredAuthzPurger2.DebugAddr != "" {
 		var stats prometheus.Registerer
@@ -76,9 +84,15 @@ func main() {
 
 	clk := cmd.Clock()
 
-	dbURL, err := c.ExpiredAuthzPurger2.DBConfig.URL()
+	dbURL, err := c.ExpiredAuthzPurger2.DB.URL()
 	cmd.FailOnError(err, "Couldn't load DB URL")
-	dbMap, err := sa.NewDbMap(dbURL, c.ExpiredAuthzPurger2.DBConfig.MaxDBConns)
+	dbSettings := sa.DbSettings{
+		MaxOpenConns:    c.ExpiredAuthzPurger2.DB.MaxOpenConns,
+		MaxIdleConns:    c.ExpiredAuthzPurger2.DB.MaxIdleConns,
+		ConnMaxLifetime: c.ExpiredAuthzPurger2.DB.ConnMaxLifetime.Duration,
+		ConnMaxIdleTime: c.ExpiredAuthzPurger2.DB.ConnMaxIdleTime.Duration,
+	}
+	dbMap, err := sa.NewDbMap(dbURL, dbSettings)
 	cmd.FailOnError(err, "Could not connect to database")
 
 	for {

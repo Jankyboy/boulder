@@ -38,7 +38,8 @@ guidelines for Boulder contributions.
   your pull request about what you're trying to accomplish with your patch.
 * Avoid named return values. See
   [#3017](https://github.com/letsencrypt/boulder/pull/3017) for an example of a
-* subtle problem they can cause. Do not include `XXX`s or naked `TODO`s. Use
+  subtle problem they can cause.
+* Do not include `XXX`s or naked `TODO`s. Use
   the formats:
 
   ```go
@@ -58,7 +59,7 @@ each commit are small, keeping them separate makes it easier for us to review
 incremental changes to a pull request. Rest assured that those tiny changes
 will get squashed into a nice meaningful-size commit when we merge.
 
-If the Travis tests are failing on your branch, you should look at the logs
+If the CI tests are failing on your branch, you should look at the logs
 to figure out why. Sometimes (though rarely) they fail spuriously, in which
 case you can post a comment requesting that a project owner kick the build.
 
@@ -339,7 +340,7 @@ docs](https://github.com/golang/go/wiki/Modules#how-to-upgrade-and-downgrade-dep
 Typically you want `go get <dependency>` rather than `go get -u
 <dependency>`, which can introduce a lot of unexpected updates. After running
 `go get`, make sure to run `go mod vendor && git add vendor/` to update the
-vendor directory. If you forget, Travis tests will catch this.
+vendor directory. If you forget, CI tests will catch this.
 
 If you are updating a dependency to a version which is not a tagged release,
 see the note above about how to run all of a dependency's tests and note that
@@ -376,6 +377,13 @@ possible there are places at which we will diverge from the letter of the
 specification for various reasons. We detail these divergences (for both the
 V1 and V2 API) in the [ACME divergences
 doc](https://github.com/letsencrypt/boulder/blob/main/docs/acme-divergences.md).
+
+# ACME Protocol Implementation Details
+
+The ACME specification allows developers to make certain decisions as to how
+various elements in the RFC are implemented. Some of these fully conformant
+decisions are listed in [ACME implementation details
+doc](https://github.com/letsencrypt/boulder/blob/main/docs/acme-implementation_details.md).
 
 ## Problems or questions?
 

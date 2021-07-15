@@ -68,6 +68,10 @@ func ChallengeToPB(challenge core.Challenge) (*corepb.Challenge, error) {
 			return nil, err
 		}
 	}
+	var validated int64
+	if challenge.Validated != nil {
+		validated = challenge.Validated.UTC().UnixNano()
+	}
 	return &corepb.Challenge{
 		Type:              string(challenge.Type),
 		Status:            string(challenge.Status),
@@ -75,6 +79,7 @@ func ChallengeToPB(challenge core.Challenge) (*corepb.Challenge, error) {
 		KeyAuthorization:  challenge.ProvidedKeyAuthorization,
 		Error:             prob,
 		Validationrecords: recordAry,
+		Validated:         validated,
 	}, nil
 }
 
@@ -99,12 +104,18 @@ func PBToChallenge(in *corepb.Challenge) (challenge core.Challenge, err error) {
 	if err != nil {
 		return core.Challenge{}, err
 	}
+	var validated *time.Time
+	if in.Validated != 0 {
+		val := time.Unix(0, in.Validated).UTC()
+		validated = &val
+	}
 	ch := core.Challenge{
 		Type:             core.AcmeChallenge(in.Type),
 		Status:           core.AcmeStatus(in.Status),
 		Token:            in.Token,
 		Error:            prob,
 		ValidationRecord: recordAry,
+		Validated:        validated,
 	}
 	if in.KeyAuthorization != "" {
 		ch.ProvidedKeyAuthorization = in.KeyAuthorization
@@ -201,7 +212,7 @@ func pbToValidationResult(in *vapb.ValidationResult) ([]core.ValidationRecord, *
 	return recordAry, prob, nil
 }
 
-func registrationToPB(reg core.Registration) (*corepb.Registration, error) {
+func RegistrationToPB(reg core.Registration) (*corepb.Registration, error) {
 	keyBytes, err := reg.Key.MarshalJSON()
 	if err != nil {
 		return nil, err
@@ -218,6 +229,10 @@ func registrationToPB(reg core.Registration) (*corepb.Registration, error) {
 	if reg.Contact != nil {
 		contacts = *reg.Contact
 	}
+	var createdAt int64
+	if reg.CreatedAt != nil {
+		createdAt = reg.CreatedAt.UTC().UnixNano()
+	}
 	return &corepb.Registration{
 		Id:              reg.ID,
 		Key:             keyBytes,
@@ -225,12 +240,12 @@ func registrationToPB(reg core.Registration) (*corepb.Registration, error) {
 		ContactsPresent: contactsPresent,
 		Agreement:       reg.Agreement,
 		InitialIP:       ipBytes,
-		CreatedAt:       reg.CreatedAt.UnixNano(),
+		CreatedAt:       createdAt,
 		Status:          string(reg.Status),
 	}, nil
 }
 
-func pbToRegistration(pb *corepb.Registration) (core.Registration, error) {
+func PbToRegistration(pb *corepb.Registration) (core.Registration, error) {
 	var key jose.JSONWebKey
 	err := key.UnmarshalJSON(pb.Key)
 	if err != nil {
@@ -240,6 +255,11 @@ func pbToRegistration(pb *corepb.Registration) (core.Registration, error) {
 	err = initialIP.UnmarshalText(pb.InitialIP)
 	if err != nil {
 		return core.Registration{}, err
+	}
+	var createdAt *time.Time
+	if pb.CreatedAt != 0 {
+		c := time.Unix(0, pb.CreatedAt).UTC()
+		createdAt = &c
 	}
 	var contacts *[]string
 	if pb.ContactsPresent {
@@ -261,7 +281,7 @@ func pbToRegistration(pb *corepb.Registration) (core.Registration, error) {
 		Contact:   contacts,
 		Agreement: pb.Agreement,
 		InitialIP: initialIP,
-		CreatedAt: time.Unix(0, pb.CreatedAt),
+		CreatedAt: createdAt,
 		Status:    core.AcmeStatus(pb.Status),
 	}, nil
 }
@@ -311,7 +331,7 @@ func PBToAuthz(pb *corepb.Authorization) (core.Authorization, error) {
 }
 
 func newRegistrationValid(reg *corepb.Registration) bool {
-	return !(len(reg.Key) == 0 || len(reg.InitialIP) == 0 || reg.CreatedAt == 0)
+	return !(len(reg.Key) == 0 || len(reg.InitialIP) == 0)
 }
 
 func registrationValid(reg *corepb.Registration) bool {

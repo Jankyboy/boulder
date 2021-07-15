@@ -1,7 +1,9 @@
 {
   "sa": {
-    "dbConnectFile": "test/secrets/sa_dburl",
-    "maxDBConns": 100,
+    "db": {
+      "dbConnectFile": "test/secrets/sa_dburl",
+      "maxOpenConns": 100
+    },
     "ParallelismPerRPC": 20,
     "debugAddr": ":8003",
     "tls": {
@@ -15,6 +17,7 @@
         "admin-revoker.boulder",
         "ca.boulder",
         "expiration-mailer.boulder",
+        "health-checker.boulder",
         "ocsp-updater.boulder",
         "orphan-finder.boulder",
         "ra.boulder",
@@ -24,7 +27,6 @@
     },
     "features": {
       "FasterNewOrdersRateLimit": true,
-      "StoreIssuerInfo": true,
       "StoreRevokerInfo": true
     }
   },
@@ -32,5 +34,9 @@
   "syslog": {
     "stdoutlevel": 6,
     "sysloglevel": 6
+  },
+  "beeline": {
+      "mute": true,
+      "dataset": "Test"
   }
 }

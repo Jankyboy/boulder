@@ -13,9 +13,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/honeycombio/beeline-go"
 	"github.com/letsencrypt/boulder/cmd"
 	"github.com/letsencrypt/boulder/core"
-	corepb "github.com/letsencrypt/boulder/core/proto"
 	"github.com/letsencrypt/boulder/db"
 	bgrpc "github.com/letsencrypt/boulder/grpc"
 	"github.com/letsencrypt/boulder/log"
@@ -24,8 +24,8 @@ import (
 	"github.com/letsencrypt/boulder/sa"
 	"github.com/prometheus/client_golang/prometheus"
 	"golang.org/x/crypto/ocsp"
-
 	"google.golang.org/grpc"
+	"google.golang.org/protobuf/types/known/emptypb"
 )
 
 var keysProcessed = prometheus.NewCounterVec(prometheus.CounterOpts{
@@ -45,7 +45,7 @@ var mailErrors = prometheus.NewCounter(prometheus.CounterOpts{
 // to only the single method we need to use, this makes testing significantly
 // simpler
 type revoker interface {
-	AdministrativelyRevokeCertificate(ctx context.Context, in *rapb.AdministrativelyRevokeCertificateRequest, opts ...grpc.CallOption) (*corepb.Empty, error)
+	AdministrativelyRevokeCertificate(ctx context.Context, in *rapb.AdministrativelyRevokeCertificateRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 }
 
 type badKeyRevoker struct {
@@ -339,7 +339,7 @@ func (bkr *badKeyRevoker) invoke() (bool, error) {
 func main() {
 	var config struct {
 		BadKeyRevoker struct {
-			cmd.DBConfig
+			DB        cmd.DBConfig
 			DebugAddr string
 
 			TLS       cmd.TLSConfig
@@ -370,7 +370,8 @@ func main() {
 			}
 		}
 
-		Syslog cmd.SyslogConfig
+		Syslog  cmd.SyslogConfig
+		Beeline cmd.BeelineConfig
 	}
 	configPath := flag.String("config", "", "File path to the configuration file for this service")
 	flag.Parse()
@@ -382,6 +383,11 @@ func main() {
 	err := cmd.ReadConfigFile(*configPath, &config)
 	cmd.FailOnError(err, "Failed reading config file")
 
+	bc, err := config.Beeline.Load()
+	cmd.FailOnError(err, "Failed to load Beeline config")
+	beeline.Init(bc)
+	defer beeline.Close()
+
 	scope, logger := cmd.StatsAndLogging(config.Syslog, config.BadKeyRevoker.DebugAddr)
 	clk := cmd.Clock()
 
@@ -389,12 +395,19 @@ func main() {
 	scope.MustRegister(certsRevoked)
 	scope.MustRegister(mailErrors)
 
-	dbURL, err := config.BadKeyRevoker.DBConfig.URL()
+	dbURL, err := config.BadKeyRevoker.DB.URL()
 	cmd.FailOnError(err, "Couldn't load DB URL")
-	dbMap, err := sa.NewDbMap(dbURL, config.BadKeyRevoker.DBConfig.MaxDBConns)
+
+	dbSettings := sa.DbSettings{
+		MaxOpenConns:    config.BadKeyRevoker.DB.MaxOpenConns,
+		MaxIdleConns:    config.BadKeyRevoker.DB.MaxIdleConns,
+		ConnMaxLifetime: config.BadKeyRevoker.DB.ConnMaxLifetime.Duration,
+		ConnMaxIdleTime: config.BadKeyRevoker.DB.ConnMaxIdleTime.Duration,
+	}
+	dbMap, err := sa.NewDbMap(dbURL, dbSettings)
 	cmd.FailOnError(err, "Could not connect to database")
 	sa.SetSQLDebug(dbMap, logger)
-	sa.InitDBMetrics(dbMap, scope)
+	sa.InitDBMetrics(dbMap, scope, dbSettings)
 
 	tlsConfig, err := config.BadKeyRevoker.TLS.Load()
 	cmd.FailOnError(err, "TLS config")

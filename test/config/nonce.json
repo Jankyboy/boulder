@@ -6,10 +6,15 @@
             "stdoutLevel": 6,
             "syslogLevel": 6
         },
+        "beeline": {
+            "mute": true,
+            "dataset": "Test"
+        },
         "debugAddr": ":8111",
         "grpc": {
             "address": ":9101",
             "clientNames": [
+                "health-checker.boulder",
                 "wfe.boulder"
             ]
         },

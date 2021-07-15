@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/honeycombio/beeline-go/wrappers/hnynethttp"
 	"github.com/jmhodges/clock"
 	"github.com/prometheus/client_golang/prometheus"
 	jose "gopkg.in/square/go-jose.v2"
@@ -24,8 +25,10 @@ import (
 	berrors "github.com/letsencrypt/boulder/errors"
 	"github.com/letsencrypt/boulder/features"
 	"github.com/letsencrypt/boulder/goodkey"
+	"github.com/letsencrypt/boulder/grpc"
 	bgrpc "github.com/letsencrypt/boulder/grpc"
 	"github.com/letsencrypt/boulder/identifier"
+	"github.com/letsencrypt/boulder/issuance"
 	blog "github.com/letsencrypt/boulder/log"
 	"github.com/letsencrypt/boulder/metrics/measured_http"
 	"github.com/letsencrypt/boulder/nonce"
@@ -35,6 +38,7 @@ import (
 	"github.com/letsencrypt/boulder/revocation"
 	sapb "github.com/letsencrypt/boulder/sa/proto"
 	"github.com/letsencrypt/boulder/web"
+	"google.golang.org/protobuf/types/known/emptypb"
 )
 
 // Paths are the ACME-spec identified URL path-segments for various methods.
@@ -74,8 +78,8 @@ type WebFrontEndImpl struct {
 	// URL configuration parameters
 	BaseURL string
 
-	// Issuer certificate (DER) for /acme/issuer-cert
-	IssuerCert []byte
+	// Issuer certificate for /acme/issuer-cert
+	IssuerCert *issuance.Certificate
 
 	// URL to the current subscriber agreement (should contain some version identifier)
 	SubscriberAgreementURL string
@@ -201,7 +205,7 @@ func (wfe *WebFrontEndImpl) HandleFunc(mux *http.ServeMux, pattern string, h web
 			// clearer both in our metrics and to the client that
 			// something is wrong.
 			if wfe.remoteNonceService != nil {
-				nonceMsg, err := wfe.remoteNonceService.Nonce(ctx, &corepb.Empty{})
+				nonceMsg, err := wfe.remoteNonceService.Nonce(ctx, &emptypb.Empty{})
 				if err != nil {
 					wfe.sendError(response, logEvent, probs.ServerInternal("unable to get nonce"), err)
 					return
@@ -334,7 +338,7 @@ func (wfe *WebFrontEndImpl) Handler(stats prometheus.Registerer) http.Handler {
 	// meaning we can wind up returning 405 when we mean to return 404. See
 	// https://github.com/letsencrypt/boulder/issues/717
 	m.Handle("/", web.NewTopHandler(wfe.log, web.WFEHandlerFunc(wfe.Index)))
-	return measured_http.New(m, wfe.clk, stats)
+	return hnynethttp.WrapHandler(measured_http.New(m, wfe.clk, stats))
 }
 
 // Method implementations
@@ -529,7 +533,7 @@ func (wfe *WebFrontEndImpl) verifyPOST(ctx context.Context, logEvent *web.Reques
 	// Special case: If no registration was found, but regCheck is false, use an
 	// empty registration and the submitted key. The caller is expected to do some
 	// validation on the returned key.
-	if berrors.Is(err, berrors.NotFound) && !regCheck {
+	if errors.Is(err, berrors.NotFound) && !regCheck {
 		// When looking up keys from the registrations DB, we can be confident they
 		// are "good". But when we are verifying against any submitted key, we want
 		// to check its quality before doing the verify.
@@ -541,7 +545,7 @@ func (wfe *WebFrontEndImpl) verifyPOST(ctx context.Context, logEvent *web.Reques
 	} else if err != nil {
 		// For all other errors, or if regCheck is true, return error immediately.
 		logEvent.AddError("unable to fetch registration by the given JWK: %s", err)
-		if berrors.Is(err, berrors.NotFound) {
+		if errors.Is(err, berrors.NotFound) {
 			return nil, nil, reg, probs.Unauthorized(unknownKey)
 		}
 
@@ -639,10 +643,10 @@ func (wfe *WebFrontEndImpl) NewRegistration(ctx context.Context, logEvent *web.R
 	}
 
 	existingReg, err := wfe.SA.GetRegistrationByKey(ctx, key)
-	if err != nil && !berrors.Is(err, berrors.NotFound) {
+	if err != nil && !errors.Is(err, berrors.NotFound) {
 		wfe.sendError(response, logEvent, probs.ServerInternal("couldn't retrieve the registration"), err)
 		return
-	} else if err == nil || !berrors.Is(err, berrors.NotFound) {
+	} else if err == nil || !errors.Is(err, berrors.NotFound) {
 		response.Header().Set("Location", web.RelativeEndpoint(request, fmt.Sprintf("%s%d", regPath, existingReg.ID)))
 		wfe.sendError(response, logEvent, probs.Conflict("Registration key is already in use"), err)
 		return
@@ -682,10 +686,15 @@ func (wfe *WebFrontEndImpl) NewRegistration(ctx context.Context, logEvent *web.R
 			return
 		}
 	}
-
-	reg, err := wfe.RA.NewRegistration(ctx, init)
+	newRegPB, err := grpc.RegistrationToPB(init)
 	if err != nil {
-		if berrors.Is(err, berrors.Duplicate) {
+		wfe.sendError(response, logEvent,
+			web.ProblemDetailsForError(err, "Error creating new account"), err)
+		return
+	}
+	regPB, err := wfe.RA.NewRegistration(ctx, newRegPB)
+	if err != nil {
+		if errors.Is(err, berrors.Duplicate) {
 			existingReg, err := wfe.SA.GetRegistrationByKey(ctx, key)
 			if err != nil {
 				// return error even if berrors.NotFound, as the duplicate key error we got from
@@ -698,6 +707,12 @@ func (wfe *WebFrontEndImpl) NewRegistration(ctx context.Context, logEvent *web.R
 			return
 		}
 		wfe.sendError(response, logEvent, web.ProblemDetailsForError(err, "Error creating new registration"), err)
+		return
+	}
+	reg, err := bgrpc.PbToRegistration(regPB)
+	if err != nil {
+		wfe.sendError(response, logEvent,
+			web.ProblemDetailsForError(err, "Error creating new account"), err)
 		return
 	}
 	logEvent.Requester = reg.ID
@@ -847,7 +862,7 @@ func (wfe *WebFrontEndImpl) RevokeCertificate(ctx context.Context, logEvent *web
 	logEvent.Extra["ProvidedCertificateSerial"] = serial
 	cert, err := wfe.SA.GetCertificate(ctx, serial)
 	if err != nil {
-		if berrors.Is(err, berrors.NotFound) {
+		if errors.Is(err, berrors.NotFound) {
 			wfe.sendError(response, logEvent, probs.NotFound("No such certificate"), err)
 			return
 		}
@@ -919,8 +934,27 @@ func (wfe *WebFrontEndImpl) RevokeCertificate(ctx context.Context, logEvent *web
 		reason = *revokeRequest.Reason
 	}
 
-	err = wfe.RA.RevokeCertificateWithReg(ctx, *parsedCertificate, reason, registration.ID)
+	_, err = wfe.RA.RevokeCertificateWithReg(ctx, &rapb.RevokeCertificateWithRegRequest{
+		Cert:  parsedCertificate.Raw,
+		Code:  int64(reason),
+		RegID: registration.ID,
+	})
 	if err != nil {
+		if errors.Is(err, berrors.Duplicate) {
+			// It is possible that between checking the certificate's status and
+			// performing the revocation, a parallel request happened and revoked the
+			// cert. In this case, just retrieve the certificate status again and
+			// return 409 Conflict.
+			certStatus, err = wfe.SA.GetCertificateStatus(ctx, serial)
+			if err != nil {
+				wfe.sendError(response, logEvent, probs.ServerInternal("Failed to get certificate status"), err)
+				return
+			}
+			if certStatus.Status == core.OCSPStatusRevoked {
+				wfe.sendError(response, logEvent, probs.Conflict("Certificate already revoked"), nil)
+				return
+			}
+		}
 		wfe.sendError(response, logEvent, web.ProblemDetailsForError(err, "Failed to revoke certificate"), err)
 	} else {
 		wfe.log.Debugf("Revoked %v", serial)
@@ -1013,7 +1047,7 @@ func (wfe *WebFrontEndImpl) NewCertificate(ctx context.Context, logEvent *web.Re
 	// authorized for target site, they could cause issuance for that site by
 	// lying to the RA. We should probably pass a copy of the whole request to the
 	// RA for secondary validation.
-	cert, err := wfe.RA.NewCertificate(ctx, certificateRequest, reg.ID)
+	cert, err := wfe.RA.NewCertificate(ctx, certificateRequest, reg.ID, int64(wfe.IssuerCert.NameID()))
 	if err != nil {
 		wfe.sendError(response, logEvent, web.ProblemDetailsForError(err, "Error creating new cert"), err)
 		return
@@ -1065,7 +1099,7 @@ func (wfe *WebFrontEndImpl) Challenge(
 	challengeID := slug[1]
 	authzPB, err := wfe.SA.GetAuthorization2(ctx, &sapb.AuthorizationID2{Id: authorizationID})
 	if err != nil {
-		if berrors.Is(err, berrors.NotFound) {
+		if errors.Is(err, berrors.NotFound) {
 			notFound()
 		} else {
 			wfe.sendError(response, logEvent, probs.ServerInternal("Problem getting authorization"), err)
@@ -1217,14 +1251,11 @@ func (wfe *WebFrontEndImpl) postChallenge(
 		authzPB, err = wfe.RA.PerformValidation(ctx, &rapb.PerformValidationRequest{
 			Authz:          authzPB,
 			ChallengeIndex: int64(challengeIndex)})
-		if err != nil {
-			wfe.sendError(
-				response,
-				logEvent,
-				web.ProblemDetailsForError(err, "Unable to perform validation for challenge"),
-				err)
+		if err != nil || authzPB == nil || authzPB.Id == "" || authzPB.Identifier == "" || authzPB.Status == "" || authzPB.Expires == 0 {
+			wfe.sendError(response, logEvent, web.ProblemDetailsForError(err, "Unable to perform validation for challenge"), err)
 			return
 		}
+
 		updatedAuthz, err := bgrpc.PBToAuthz(authzPB)
 		if err != nil {
 			wfe.sendError(response, logEvent, web.ProblemDetailsForError(err, "Unable to deserialize authz"), err)
@@ -1322,7 +1353,18 @@ func (wfe *WebFrontEndImpl) Registration(ctx context.Context, logEvent *web.Requ
 	// JSON to send via RPC to the RA.
 	update.Key = currReg.Key
 
-	updatedReg, err := wfe.RA.UpdateRegistration(ctx, currReg, update)
+	currRegPb, err := bgrpc.RegistrationToPB(currReg)
+	if err != nil {
+		wfe.sendError(response, logEvent, probs.ServerInternal("Error marshaling Registration to proto"), err)
+		return
+	}
+	updateRegPb, err := bgrpc.RegistrationToPB(update)
+	if err != nil {
+		wfe.sendError(response, logEvent, probs.ServerInternal("Error marshaling Registration update to proto"), err)
+		return
+	}
+
+	updatedRegPb, err := wfe.RA.UpdateRegistration(ctx, &rapb.UpdateRegistrationRequest{Base: currRegPb, Update: updateRegPb})
 	if err != nil {
 		wfe.sendError(response, logEvent, web.ProblemDetailsForError(err, "Unable to update registration"), err)
 		return
@@ -1333,6 +1375,11 @@ func (wfe *WebFrontEndImpl) Registration(ctx context.Context, logEvent *web.Requ
 		response.Header().Add("Link", link(wfe.SubscriberAgreementURL, "terms-of-service"))
 	}
 
+	updatedReg, err := bgrpc.PbToRegistration(updatedRegPb)
+	if err != nil {
+		wfe.sendError(response, logEvent, probs.ServerInternal("Error marshaling proto to Registration"), err)
+		return
+	}
 	err = wfe.writeJsonResponse(response, logEvent, http.StatusAccepted, updatedReg)
 	if err != nil {
 		// ServerInternal because we just generated the reg, it should be OK
@@ -1392,7 +1439,7 @@ func (wfe *WebFrontEndImpl) Authorization(ctx context.Context, logEvent *web.Req
 	}
 	authzPB, err := wfe.SA.GetAuthorization2(ctx, &sapb.AuthorizationID2{Id: authzID})
 	if err != nil {
-		if berrors.Is(err, berrors.NotFound) {
+		if errors.Is(err, berrors.NotFound) {
 			notFound()
 		} else {
 			wfe.sendError(response, logEvent, probs.ServerInternal("Problem getting authorization"), err)
@@ -1455,7 +1502,7 @@ func (wfe *WebFrontEndImpl) Certificate(ctx context.Context, logEvent *web.Reque
 		ierr := fmt.Errorf("unable to get certificate by serial id %#v: %s", serial, err)
 		if strings.HasPrefix(err.Error(), "gorp: multiple rows returned") {
 			wfe.sendError(response, logEvent, probs.Conflict("Multiple certificates with same short serial"), ierr)
-		} else if berrors.Is(err, berrors.NotFound) {
+		} else if errors.Is(err, berrors.NotFound) {
 			wfe.sendError(response, logEvent, probs.NotFound("Certificate not found"), ierr)
 		} else {
 			wfe.sendError(response, logEvent, probs.ServerInternal("Failed to retrieve certificate"), ierr)
@@ -1484,7 +1531,7 @@ func (wfe *WebFrontEndImpl) Issuer(ctx context.Context, logEvent *web.RequestEve
 	// TODO Content negotiation
 	response.Header().Set("Content-Type", "application/pkix-cert")
 	response.WriteHeader(http.StatusOK)
-	if _, err := response.Write(wfe.IssuerCert); err != nil {
+	if _, err := response.Write(wfe.IssuerCert.Raw); err != nil {
 		wfe.log.Warningf("Could not write response: %s", err)
 	}
 }
@@ -1597,11 +1644,32 @@ func (wfe *WebFrontEndImpl) KeyRollover(ctx context.Context, logEvent *web.Reque
 		wfe.sendError(response, logEvent, probs.Malformed("New JWK in inner payload doesn't match key used to sign inner JWS"), nil)
 		return
 	}
+	// Convert account to proto for grpc
+	regPb, err := bgrpc.RegistrationToPB(reg)
+	if err != nil {
+		wfe.sendError(response, logEvent, probs.ServerInternal("Error marshaling Registration to proto"), err)
+		return
+	}
+	// Marshal key to bytes
+	newKeyBytes, err := newKey.MarshalJSON()
+	if err != nil {
+		wfe.sendError(response, logEvent, probs.ServerInternal("Error marshaling new key"), err)
+	}
+
+	// Copy new key into an empty registration to provide as the update
+	updatePb := &corepb.Registration{Key: newKeyBytes}
 
 	// Update registration key
-	updatedReg, err := wfe.RA.UpdateRegistration(ctx, reg, core.Registration{Key: newKey})
+	updatedRegPb, err := wfe.RA.UpdateRegistration(ctx, &rapb.UpdateRegistrationRequest{Base: regPb, Update: updatePb})
 	if err != nil {
 		wfe.sendError(response, logEvent, web.ProblemDetailsForError(err, "Unable to update registration"), err)
+		return
+	}
+
+	// Convert proto to registration for display
+	updatedReg, err := bgrpc.PbToRegistration(updatedRegPb)
+	if err != nil {
+		wfe.sendError(response, logEvent, probs.ServerInternal("Error marshaling proto to registration"), err)
 		return
 	}
 
@@ -1616,7 +1684,11 @@ func (wfe *WebFrontEndImpl) KeyRollover(ctx context.Context, logEvent *web.Reque
 }
 
 func (wfe *WebFrontEndImpl) deactivateRegistration(ctx context.Context, reg core.Registration, response http.ResponseWriter, request *http.Request, logEvent *web.RequestEvent) {
-	err := wfe.RA.DeactivateRegistration(ctx, reg)
+	regPb := &corepb.Registration{
+		Id:     reg.ID,
+		Status: string(reg.Status),
+	}
+	_, err := wfe.RA.DeactivateRegistration(ctx, regPb)
 	if err != nil {
 		wfe.sendError(response, logEvent, web.ProblemDetailsForError(err, "Error deactivating registration"), err)
 		return

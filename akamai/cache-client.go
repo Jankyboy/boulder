@@ -241,7 +241,7 @@ func (cpc *CachePurgeClient) purge(urls []string) error {
 		return fmt.Errorf("Unexpected HTTP status code '%d': %s", resp.StatusCode, string(body))
 	}
 
-	cpc.log.Infof("Sent successful purge request purgeID: %s, purge expected in: %ds, for URLs: %s",
+	cpc.log.AuditInfof("Sent successful purge request purgeID: %s, purge expected in: %ds, for URLs: %s",
 		purgeInfo.PurgeID, purgeInfo.EstimatedSeconds, urls)
 
 	return nil
@@ -254,7 +254,8 @@ func (cpc *CachePurgeClient) purgeBatch(urls []string) error {
 
 		err := cpc.purge(urls)
 		if err != nil {
-			if _, ok := err.(errFatal); ok {
+			var errorFatal errFatal
+			if errors.As(err, &errorFatal) {
 				cpc.purges.WithLabelValues("fatal failure").Inc()
 				return err
 			}
@@ -356,13 +357,11 @@ func generateOCSPCacheKeys(req []byte, ocspServer string) []string {
 	}
 }
 
-// GeneratePurgeURLs ...
-func GeneratePurgeURLs(der []byte, issuer *x509.Certificate) ([]string, error) {
-	cert, err := x509.ParseCertificate(der)
-	if err != nil {
-		return nil, err
-	}
-
+// GeneratePurgeURLs generates akamai URLs that can be POSTed to in order to
+// purge akamai's cache of the corresponding OCSP responses. The URLs encode
+// the contents of the OCSP request, so this method constructs a full OCSP
+// request.
+func GeneratePurgeURLs(cert, issuer *x509.Certificate) ([]string, error) {
 	req, err := ocsp.CreateRequest(cert, issuer, nil)
 	if err != nil {
 		return nil, err

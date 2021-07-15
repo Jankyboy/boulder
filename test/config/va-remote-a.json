@@ -21,6 +21,7 @@
     "grpc": {
       "address": ":9097",
       "clientNames": [
+        "health-checker.boulder",
         "va.boulder"
       ]
     },
@@ -37,6 +38,10 @@
   "syslog": {
     "stdoutlevel": 6,
     "sysloglevel": 4
+  },
+  "beeline": {
+      "mute": true,
+      "dataset": "Test"
   },
 
   "common": {

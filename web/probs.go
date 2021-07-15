@@ -1,6 +1,7 @@
 package web
 
 import (
+	"errors"
 	"fmt"
 
 	berrors "github.com/letsencrypt/boulder/errors"
@@ -27,8 +28,6 @@ func problemDetailsForBoulderError(err *berrors.BoulderError, msg string) *probs
 		outProb = probs.RejectedIdentifier(fmt.Sprintf("%s :: %s", msg, err))
 	case berrors.InvalidEmail:
 		outProb = probs.InvalidEmail(fmt.Sprintf("%s :: %s", msg, err))
-	case berrors.WrongAuthorizationState:
-		outProb = probs.Malformed(fmt.Sprintf("%s :: %s", msg, err))
 	case berrors.CAA:
 		outProb = probs.CAA(fmt.Sprintf("%s :: %s", msg, err))
 	case berrors.MissingSCTs:
@@ -63,12 +62,13 @@ func problemDetailsForBoulderError(err *berrors.BoulderError, msg string) *probs
 // error is of an type unknown to ProblemDetailsForError, it will return a
 // ServerInternal ProblemDetails.
 func ProblemDetailsForError(err error, msg string) *probs.ProblemDetails {
-	switch e := err.(type) {
-	case *probs.ProblemDetails:
-		return e
-	case *berrors.BoulderError:
-		return problemDetailsForBoulderError(e, msg)
-	default:
+	var probsProblemDetails *probs.ProblemDetails
+	var berrorsBoulderError *berrors.BoulderError
+	if errors.As(err, &probsProblemDetails) {
+		return probsProblemDetails
+	} else if errors.As(err, &berrorsBoulderError) {
+		return problemDetailsForBoulderError(berrorsBoulderError, msg)
+	} else {
 		// Internal server error messages may include sensitive data, so we do
 		// not include it.
 		return probs.ServerInternal(msg)

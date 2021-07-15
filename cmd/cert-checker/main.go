@@ -17,8 +17,8 @@ import (
 	"github.com/jmhodges/clock"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/zmap/zcrypto/x509"
-	"github.com/zmap/zlint/v2"
-	"github.com/zmap/zlint/v2/lint"
+	"github.com/zmap/zlint/v3"
+	"github.com/zmap/zlint/v3/lint"
 
 	"github.com/letsencrypt/boulder/cmd"
 	"github.com/letsencrypt/boulder/core"
@@ -27,10 +27,6 @@ import (
 	blog "github.com/letsencrypt/boulder/log"
 	"github.com/letsencrypt/boulder/policy"
 	"github.com/letsencrypt/boulder/sa"
-)
-
-const (
-	expectedValidityPeriod = time.Hour * 24 * 90
 )
 
 // For defense-in-depth in addition to using the PA & its hostnamePolicy to
@@ -87,25 +83,27 @@ type certDB interface {
 }
 
 type certChecker struct {
-	pa           core.PolicyAuthority
-	dbMap        certDB
-	certs        chan core.Certificate
-	clock        clock.Clock
-	rMu          *sync.Mutex
-	issuedReport report
-	checkPeriod  time.Duration
+	pa                        core.PolicyAuthority
+	dbMap                     certDB
+	certs                     chan core.Certificate
+	clock                     clock.Clock
+	rMu                       *sync.Mutex
+	issuedReport              report
+	checkPeriod               time.Duration
+	acceptableValidityPeriods map[uint]bool
 }
 
-func newChecker(saDbMap certDB, clk clock.Clock, pa core.PolicyAuthority, period time.Duration) certChecker {
+func newChecker(saDbMap certDB, clk clock.Clock, pa core.PolicyAuthority, period time.Duration, avps map[uint]bool) certChecker {
 	c := certChecker{
-		pa:          pa,
-		dbMap:       saDbMap,
-		certs:       make(chan core.Certificate, batchSize),
-		rMu:         new(sync.Mutex),
-		clock:       clk,
-		checkPeriod: period,
+		pa:                        pa,
+		dbMap:                     saDbMap,
+		certs:                     make(chan core.Certificate, batchSize),
+		rMu:                       new(sync.Mutex),
+		clock:                     clk,
+		issuedReport:              report{Entries: make(map[string]reportEntry)},
+		checkPeriod:               period,
+		acceptableValidityPeriods: avps,
 	}
-	c.issuedReport.Entries = make(map[string]reportEntry)
 
 	return c
 }
@@ -128,7 +126,7 @@ func (c *certChecker) getCerts(unexpiredOnly bool) error {
 	}
 
 	initialID, err := c.dbMap.SelectInt(
-		"SELECT id FROM certificates WHERE issued >= :issued AND expires >= :now LIMIT 1",
+		"SELECT MIN(id) FROM certificates WHERE issued >= :issued AND expires >= :now",
 		args,
 	)
 	if err != nil {
@@ -251,12 +249,11 @@ func (c *certChecker) checkCert(cert core.Certificate, ignoredLints map[string]b
 		if parsedCert.IsCA {
 			problems = append(problems, "Certificate can sign other certificates")
 		}
-		// Check the cert has the correct validity period
-		validityPeriod := parsedCert.NotAfter.Sub(parsedCert.NotBefore)
-		if validityPeriod > expectedValidityPeriod {
-			problems = append(problems, fmt.Sprintf("Certificate has a validity period longer than %s", expectedValidityPeriod))
-		} else if validityPeriod < expectedValidityPeriod {
-			problems = append(problems, fmt.Sprintf("Certificate has a validity period shorter than %s", expectedValidityPeriod))
+		// Check the cert has the correct validity period. The validity period is
+		// computed inclusive of the whole final second indicated by notAfter.
+		validityPeriod := parsedCert.NotAfter.Add(time.Second).Sub(parsedCert.NotBefore)
+		if _, ok := c.acceptableValidityPeriods[uint(validityPeriod.Seconds())]; !ok {
+			problems = append(problems, fmt.Sprintf("Certificate has unacceptable validity period"))
 		}
 		// Check the stored issuance time isn't too far back/forward dated
 		if parsedCert.NotBefore.Before(cert.Issued.Add(-6*time.Hour)) || parsedCert.NotBefore.After(cert.Issued.Add(6*time.Hour)) {
@@ -309,7 +306,7 @@ func (c *certChecker) checkCert(cert core.Certificate, ignoredLints map[string]b
 
 type config struct {
 	CertChecker struct {
-		cmd.DBConfig
+		DB cmd.DBConfig
 		cmd.HostnamePolicyConfig
 
 		Workers             int
@@ -317,6 +314,10 @@ type config struct {
 		UnexpiredOnly       bool
 		BadResultsOnly      bool
 		CheckPeriod         cmd.ConfigDuration
+
+		// AcceptableValidityPeriods is a list of lengths (in seconds) which are
+		// acceptable Validity Periods for certificates we issue.
+		AcceptableValidityPeriods []uint
 
 		// IgnoredLints is a list of zlint names. Any lint results from a lint in
 		// the IgnoredLists list are ignored regardless of LintStatus level.
@@ -359,7 +360,7 @@ func main() {
 	cmd.FailOnError(err, "Failed to set audit logger")
 
 	if *connect != "" {
-		config.CertChecker.DBConnect = *connect
+		config.CertChecker.DB.DBConnect = *connect
 	}
 	if *workers != 0 {
 		config.CertChecker.Workers = *workers
@@ -368,15 +369,37 @@ func main() {
 	config.CertChecker.BadResultsOnly = *badResultsOnly
 	config.CertChecker.CheckPeriod.Duration = *cp
 
+	avps := make(map[uint]bool)
+	if len(config.CertChecker.AcceptableValidityPeriods) == 0 {
+		// For backwards compatibility, assume only a single valid validity period
+		// of exactly 90 days if none is configured.
+		avps[uint((time.Hour * 24 * 90).Seconds())] = true
+	} else {
+		for _, period := range config.CertChecker.AcceptableValidityPeriods {
+			avps[period] = true
+		}
+	}
+
 	// Validate PA config and set defaults if needed
 	cmd.FailOnError(config.PA.CheckChallenges(), "Invalid PA configuration")
 
-	saDbURL, err := config.CertChecker.DBConfig.URL()
+	saDbURL, err := config.CertChecker.DB.URL()
 	cmd.FailOnError(err, "Couldn't load DB URL")
-	saDbMap, err := sa.NewDbMap(saDbURL, config.CertChecker.DBConfig.MaxDBConns)
+	dbSettings := sa.DbSettings{
+		MaxOpenConns:    config.CertChecker.DB.MaxOpenConns,
+		MaxIdleConns:    config.CertChecker.DB.MaxIdleConns,
+		ConnMaxLifetime: config.CertChecker.DB.ConnMaxLifetime.Duration,
+		ConnMaxIdleTime: config.CertChecker.DB.ConnMaxIdleTime.Duration,
+	}
+	saDbMap, err := sa.NewDbMap(saDbURL, dbSettings)
 	cmd.FailOnError(err, "Could not connect to database")
 
-	sa.InitDBMetrics(saDbMap, prometheus.DefaultRegisterer)
+	sa.InitDBMetrics(saDbMap, prometheus.DefaultRegisterer, dbSettings)
+
+	_, err = saDbMap.Exec(
+		"SET SESSION TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;",
+	)
+	cmd.FailOnError(err, "Failed to set transaction isolation level at the DB")
 
 	checkerLatency := prometheus.NewHistogram(prometheus.HistogramOpts{
 		Name: "cert_checker_latency",
@@ -394,6 +417,7 @@ func main() {
 		cmd.Clock(),
 		pa,
 		config.CertChecker.CheckPeriod.Duration,
+		avps,
 	)
 	fmt.Fprintf(os.Stderr, "# Getting certificates issued in the last %s\n", config.CertChecker.CheckPeriod)
 

@@ -19,7 +19,7 @@ import (
 
 type fillerConfig struct {
 	Filler struct {
-		cmd.DBConfig
+		DB          cmd.DBConfig
 		Parallelism uint
 	}
 }
@@ -45,10 +45,13 @@ func main() {
 	cmd.FailOnError(err, "Failed to parse config")
 
 	// Configure DB
-	dbURL, err := config.Filler.DBConfig.URL()
+	dbURL, err := config.Filler.DB.URL()
 	cmd.FailOnError(err, "Couldn't load DB URL")
 	// Set max connections equal to parallelism.
-	dbMap, err := sa.NewDbMap(dbURL, int(config.Filler.Parallelism))
+	dbSettings := sa.DbSettings{
+		MaxOpenConns: int(config.Filler.Parallelism),
+	}
+	dbMap, err := sa.NewDbMap(dbURL, dbSettings)
 	cmd.FailOnError(err, "Could not connect to database")
 
 	dbMap.AddTableWithName(model{}, "pendingAuthorizations").SetKeys(false, "ID")

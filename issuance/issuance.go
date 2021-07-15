@@ -13,6 +13,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/asn1"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io/ioutil"
@@ -21,14 +22,13 @@ import (
 	"strings"
 	"time"
 
-	"github.com/cloudflare/cfssl/helpers"
 	ct "github.com/google/certificate-transparency-go"
 	cttls "github.com/google/certificate-transparency-go/tls"
 	ctx509 "github.com/google/certificate-transparency-go/x509"
 	"github.com/jmhodges/clock"
 	"github.com/letsencrypt/boulder/cmd"
 	"github.com/letsencrypt/boulder/core"
-	"github.com/letsencrypt/boulder/lint"
+	"github.com/letsencrypt/boulder/linter"
 	"github.com/letsencrypt/boulder/policyasn1"
 	"github.com/letsencrypt/pkcs11key/v4"
 )
@@ -87,35 +87,71 @@ type IssuerLoc struct {
 }
 
 // LoadIssuer loads a signer (private key) and certificate from the locations specified.
-func LoadIssuer(location IssuerLoc) (*x509.Certificate, crypto.Signer, error) {
-	cert, err := core.LoadCert(location.CertFile)
+func LoadIssuer(location IssuerLoc) (*Certificate, crypto.Signer, error) {
+	issuerCert, err := LoadCertificate(location.CertFile)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	signer, err := loadSigner(location, cert)
+	signer, err := loadSigner(location, issuerCert)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	if !core.KeyDigestEquals(signer.Public(), cert.PublicKey) {
+	if !core.KeyDigestEquals(signer.Public(), issuerCert.PublicKey) {
 		return nil, nil, fmt.Errorf("Issuer key did not match issuer cert %s", location.CertFile)
 	}
-	return cert, signer, err
+	return issuerCert, signer, err
 }
 
-func loadSigner(location IssuerLoc, cert *x509.Certificate) (crypto.Signer, error) {
+func LoadCertificate(path string) (*Certificate, error) {
+	cert, err := core.LoadCert(path)
+	if err != nil {
+		return nil, err
+	}
+	return &Certificate{cert}, nil
+}
+
+func loadSigner(location IssuerLoc, cert *Certificate) (crypto.Signer, error) {
 	if location.File != "" {
 		keyBytes, err := ioutil.ReadFile(location.File)
 		if err != nil {
-			return nil, fmt.Errorf("Could not read key file %s", location.File)
+			return nil, fmt.Errorf("Could not read key file %q", location.File)
 		}
 
-		signer, err := helpers.ParsePrivateKeyPEM(keyBytes)
-		if err != nil {
-			return nil, err
+		var keyDER *pem.Block
+		for {
+			keyDER, keyBytes = pem.Decode(keyBytes)
+			if keyDER == nil || keyDER.Type != "EC PARAMETERS" {
+				break
+			}
 		}
-		return signer, nil
+		if keyDER == nil {
+			return nil, fmt.Errorf("No key block found in %q", location.File)
+		}
+
+		// Try to interpret the bytes first as a generic PKCS8 key, then fall back
+		// to a PKCS1 RSA key, then fall back to an EC key.
+		// These blocks use the opposite of normal error checking patterns, to let
+		// us early-return once we successfully parse once.
+		signer, err := x509.ParsePKCS8PrivateKey(keyDER.Bytes)
+		if err == nil {
+			switch signer.(type) {
+			case *rsa.PrivateKey:
+				return signer.(*rsa.PrivateKey), nil
+			case *ecdsa.PrivateKey:
+				return signer.(*ecdsa.PrivateKey), nil
+			}
+		}
+		rsaSigner, err := x509.ParsePKCS1PrivateKey(keyDER.Bytes)
+		if err == nil {
+			return rsaSigner, nil
+		}
+		ecdsaSigner, err := x509.ParseECPrivateKey(keyDER.Bytes)
+		if err == nil {
+			return ecdsaSigner, nil
+		}
+		return nil, fmt.Errorf("Unable to parse %q", location.File)
 	}
 
 	var pkcs11Config *pkcs11key.Config
@@ -278,7 +314,9 @@ func (p *Profile) requestValid(clk clock.Clock, req *IssuanceRequest) error {
 		return errors.New("common name cannot be included")
 	}
 
-	validity := req.NotAfter.Sub(req.NotBefore)
+	// The validity period is calculated inclusive of the whole second represented
+	// by the notAfter timestamp.
+	validity := req.NotAfter.Add(time.Second).Sub(req.NotBefore)
 	if validity <= 0 {
 		return errors.New("NotAfter must be after NotBefore")
 	}
@@ -325,19 +363,68 @@ func (p *Profile) generateTemplate(clk clock.Clock) *x509.Certificate {
 	return template
 }
 
+// Certificate embeds an *x509.Certificate and represent the added semantics
+// that this certificate can be used for issuance. It also provides the .ID()
+// method, which returns an internal issuer ID for this certificate.
+type Certificate struct {
+	*x509.Certificate
+}
+
+type IssuerID int64
+
+// ID provides a stable ID for an issuer's certificate. This is used for
+// identifying which issuer issued a certificate in the certificateStatus table.
+// This value is computed as a truncated hash over the whole certificate,
+// meaning it is highly unique but not computable from end-entity certs.
+func (ic *Certificate) ID() IssuerID {
+	h := sha256.Sum256(ic.Raw)
+	return IssuerID(big.NewInt(0).SetBytes(h[:4]).Int64())
+}
+
+// IssuerNameID is a statistically-unique small ID which can be computed from
+// both CA and end-entity certs to link them together into a validation chain.
+// It is computed as a truncated hash over the issuer Subject Name bytes, or
+// over the end-entity's Issuer Name bytes, which are required to be equal.
+type IssuerNameID int64
+
+// NameID computes the IssuerNameID from an issuer certificate, i.e. it
+// computes a truncated hash over the issuer's Subject Name raw bytes. Useful
+// for storing as a lookup key in contexts that don't expect hash collisions.
+func (ic *Certificate) NameID() IssuerNameID {
+	return truncatedHash(ic.RawSubject)
+}
+
+// GetIssuerNameID computes the IssuerNameID from an end-entity certificate,
+// i.e. it computes a truncated hash over its Issuer Name raw bytes.
+// Useful for performing lookups in contexts that don't expect hash collisions.
+func GetIssuerNameID(ee *x509.Certificate) IssuerNameID {
+	return truncatedHash(ee.RawIssuer)
+}
+
+// truncatedHash computes a truncated SHA1 hash across arbitrary bytes. Uses
+// SHA1 because that is the algorithm most commonly used in OCSP requests.
+// PURPOSEFULLY NOT EXPORTED. Exists only to ensure that the implementations of
+// Certificate.NameID() and GetIssuerNameID() never diverge. Use those instead.
+func truncatedHash(name []byte) IssuerNameID {
+	h := crypto.SHA1.New()
+	h.Write(name)
+	s := h.Sum(nil)
+	return IssuerNameID(big.NewInt(0).SetBytes(s[:7]).Int64())
+}
+
 // Issuer is capable of issuing new certificates
 // TODO(#5086): make Cert and Signer private when they're no longer needed by ca.internalIssuer
 type Issuer struct {
-	Cert    *x509.Certificate
+	Cert    *Certificate
 	Signer  crypto.Signer
 	Profile *Profile
-	Linter  *lint.Linter
+	Linter  *linter.Linter
 	Clk     clock.Clock
 }
 
 // NewIssuer constructs an Issuer on the heap, verifying that the profile
 // is well-formed.
-func NewIssuer(cert *x509.Certificate, signer crypto.Signer, profile *Profile, linter *lint.Linter, clk clock.Clock) (*Issuer, error) {
+func NewIssuer(cert *Certificate, signer crypto.Signer, profile *Profile, linter *linter.Linter, clk clock.Clock) (*Issuer, error) {
 	switch k := cert.PublicKey.(type) {
 	case *rsa.PublicKey:
 		profile.sigAlg = x509.SHA256WithRSA
@@ -395,9 +482,8 @@ func (i *Issuer) Name() string {
 
 // ID provides a stable ID for an issuer's certificate. This is used for
 // identifying which issuer issued a certificate in the certificateStatus table.
-func (i *Issuer) ID() int64 {
-	h := sha256.Sum256(i.Cert.Raw)
-	return big.NewInt(0).SetBytes(h[:4]).Int64()
+func (i *Issuer) ID() IssuerID {
+	return i.Cert.ID()
 }
 
 var ctPoisonExt = pkix.Extension{
@@ -526,12 +612,12 @@ func (i *Issuer) Issue(req *IssuanceRequest) ([]byte, error) {
 
 	// check that the tbsCertificate is properly formed by signing it
 	// with a throwaway key and then linting it using zlint
-	err = i.Linter.LintTBS(template, i.Cert, req.PublicKey)
+	err = i.Linter.Check(template, req.PublicKey)
 	if err != nil {
 		return nil, fmt.Errorf("tbsCertificate linting failed: %w", err)
 	}
 
-	return x509.CreateCertificate(rand.Reader, template, i.Cert, req.PublicKey, i.Signer)
+	return x509.CreateCertificate(rand.Reader, template, i.Cert.Certificate, req.PublicKey, i.Signer)
 }
 
 func ContainsMustStaple(extensions []pkix.Extension) bool {
@@ -569,4 +655,46 @@ func RequestFromPrecert(precert *x509.Certificate, scts []ct.SignedCertificateTi
 		IncludeMustStaple: ContainsMustStaple(precert.Extensions),
 		SCTList:           scts,
 	}, nil
+}
+
+// LoadChain takes a list of filenames containing pem-formatted certificates,
+// and returns a chain representing all of those certificates in order. It
+// ensures that the resulting chain is valid. The final file is expected to be
+// a root certificate, which the chain will be verified against, but which will
+// not be included in the resulting chain.
+func LoadChain(certFiles []string) ([]*Certificate, error) {
+	if len(certFiles) < 2 {
+		return nil, errors.New(
+			"each chain must have at least two certificates: an intermediate and a root")
+	}
+
+	// Pre-load all the certificates to make validation easier.
+	certs := make([]*x509.Certificate, len(certFiles))
+	var err error
+	for i := 0; i < len(certFiles); i++ {
+		certs[i], err = core.LoadCert(certFiles[i])
+		if err != nil {
+			return nil, fmt.Errorf("failed to load certificate: %w", err)
+		}
+	}
+
+	// Iterate over all certs except for the last, checking that their signature
+	// comes from the next cert in the list
+	chain := make([]*Certificate, len(certFiles)-1)
+	for i := 0; i < len(certs)-1; i++ {
+		err = certs[i].CheckSignatureFrom(certs[i+1])
+		if err != nil {
+			return nil, fmt.Errorf("failed to verify chain: %w", err)
+		}
+		// Add each cert to the chain.
+		chain[i] = &Certificate{certs[i]}
+	}
+
+	err = certs[len(certs)-1].CheckSignatureFrom(certs[len(certs)-1])
+	if err != nil {
+		return nil, fmt.Errorf(
+			"final cert in chain must be a self-signed (used only for validation): %w", err)
+	}
+
+	return chain, nil
 }

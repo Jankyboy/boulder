@@ -43,10 +43,12 @@ import (
 	"regexp"
 	"time"
 
+	"github.com/honeycombio/beeline-go"
 	"github.com/jmhodges/clock"
 	"github.com/prometheus/client_golang/prometheus"
 	"golang.org/x/crypto/ocsp"
 
+	"github.com/letsencrypt/boulder/core"
 	blog "github.com/letsencrypt/boulder/log"
 )
 
@@ -145,6 +147,7 @@ var responseTypeToString = map[ocsp.ResponseStatus]string{
 type Responder struct {
 	Source        Source
 	responseTypes *prometheus.CounterVec
+	responseAges  prometheus.Histogram
 	requestSizes  prometheus.Histogram
 	clk           clock.Clock
 	log           blog.Logger
@@ -160,6 +163,19 @@ func NewResponder(source Source, stats prometheus.Registerer, logger blog.Logger
 		},
 	)
 	stats.MustRegister(requestSizes)
+
+	// Set up 12-hour-wide buckets, measured in seconds.
+	buckets := make([]float64, 14)
+	for i := range buckets {
+		buckets[i] = 43200 * float64(i)
+	}
+	responseAges := prometheus.NewHistogram(prometheus.HistogramOpts{
+		Name:    "ocsp_response_ages",
+		Help:    "How old are the OCSP responses when we serve them. Must stay well below 84 hours.",
+		Buckets: buckets,
+	})
+	stats.MustRegister(responseAges)
+
 	responseTypes := prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "ocsp_responses",
@@ -172,6 +188,7 @@ func NewResponder(source Source, stats prometheus.Registerer, logger blog.Logger
 	return &Responder{
 		Source:        source,
 		responseTypes: responseTypes,
+		responseAges:  responseAges,
 		requestSizes:  requestSizes,
 		clk:           clock.New(),
 		log:           logger,
@@ -227,6 +244,7 @@ var hashToString = map[crypto.Hash]string{
 // strings of repeated '/' into a single '/', which will break the base64
 // encoding.
 func (rs Responder) ServeHTTP(response http.ResponseWriter, request *http.Request) {
+	ctx := request.Context()
 	le := logEvent{
 		IP:       request.RemoteAddr,
 		UA:       request.UserAgent(),
@@ -234,6 +252,10 @@ func (rs Responder) ServeHTTP(response http.ResponseWriter, request *http.Reques
 		Path:     request.URL.Path,
 		Received: time.Now(),
 	}
+	beeline.AddFieldToTrace(ctx, "real_ip", request.RemoteAddr)
+	beeline.AddFieldToTrace(ctx, "method", request.Method)
+	beeline.AddFieldToTrace(ctx, "user_agent", request.UserAgent())
+	beeline.AddFieldToTrace(ctx, "path", request.URL.Path)
 	defer func() {
 		le.Headers = response.Header()
 		le.Took = time.Since(le.Received)
@@ -324,14 +346,18 @@ func (rs Responder) ServeHTTP(response http.ResponseWriter, request *http.Reques
 		return
 	}
 	le.Serial = fmt.Sprintf("%x", ocspRequest.SerialNumber.Bytes())
+	beeline.AddFieldToTrace(ctx, "request.serial", core.SerialToString(ocspRequest.SerialNumber))
 	le.IssuerKeyHash = fmt.Sprintf("%x", ocspRequest.IssuerKeyHash)
+	beeline.AddFieldToTrace(ctx, "ocsp.issuer_key_hash", ocspRequest.IssuerKeyHash)
 	le.IssuerNameHash = fmt.Sprintf("%x", ocspRequest.IssuerNameHash)
+	beeline.AddFieldToTrace(ctx, "ocsp.issuer_name_hash", ocspRequest.IssuerNameHash)
 	le.HashAlg = hashToString[ocspRequest.HashAlgorithm]
+	beeline.AddFieldToTrace(ctx, "ocsp.hash_alg", hashToString[ocspRequest.HashAlgorithm])
 
 	// Look up OCSP response from source
 	ocspResponse, headers, err := rs.Source.Response(ocspRequest)
 	if err != nil {
-		if err == ErrNotFound {
+		if errors.Is(err, ErrNotFound) {
 			rs.log.Infof("No response found for request: serial %x, request body %s",
 				ocspRequest.SerialNumber, b64Body)
 			response.Write(ocsp.UnauthorizedErrorResponse)
@@ -393,5 +419,6 @@ func (rs Responder) ServeHTTP(response http.ResponseWriter, request *http.Reques
 	}
 	response.WriteHeader(http.StatusOK)
 	response.Write(ocspResponse)
+	rs.responseAges.Observe(rs.clk.Now().Sub(parsedResponse.ThisUpdate).Seconds())
 	rs.responseTypes.With(prometheus.Labels{"type": responseTypeToString[ocsp.Success]}).Inc()
 }

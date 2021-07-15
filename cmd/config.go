@@ -6,31 +6,34 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"io/ioutil"
+	"math"
+	"os"
+	"path"
 	"strings"
 	"time"
 
+	"github.com/honeycombio/beeline-go"
 	"github.com/letsencrypt/boulder/core"
 )
 
-// PasswordConfig either contains a password or the path to a file
-// containing a password
+// PasswordConfig contains a path to a file containing a password.
 type PasswordConfig struct {
-	Password     string
 	PasswordFile string
 }
 
-// Pass returns a password, either directly from the configuration
-// struct or by reading from a specified file
+// Pass returns a password, extracted from the PasswordConfig's PasswordFile
 func (pc *PasswordConfig) Pass() (string, error) {
-	if pc.PasswordFile != "" {
-		contents, err := ioutil.ReadFile(pc.PasswordFile)
-		if err != nil {
-			return "", err
-		}
-		return strings.TrimRight(string(contents), "\n"), nil
+	// Make PasswordConfigs optional, for backwards compatibility.
+	if pc.PasswordFile == "" {
+		return "", nil
 	}
-	return pc.Password, nil
+	contents, err := ioutil.ReadFile(pc.PasswordFile)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimRight(string(contents), "\n"), nil
 }
 
 // ServiceConfig contains config items that are common to all our services, to
@@ -49,7 +52,30 @@ type DBConfig struct {
 	DBConnect string
 	// A file containing a connect URL for the DB.
 	DBConnectFile string
-	MaxDBConns    int
+
+	// MaxOpenConns sets the maximum number of open connections to the
+	// database. If MaxIdleConns is greater than 0 and MaxOpenConns is
+	// less than MaxIdleConns, then MaxIdleConns will be reduced to
+	// match the new MaxOpenConns limit. If n < 0, then there is no
+	// limit on the number of open connections.
+	MaxOpenConns int
+
+	// MaxIdleConns sets the maximum number of connections in the idle
+	// connection pool. If MaxOpenConns is greater than 0 but less than
+	// MaxIdleConns, then MaxIdleConns will be reduced to match the
+	// MaxOpenConns limit. If n < 0, no idle connections are retained.
+	MaxIdleConns int
+
+	// ConnMaxLifetime sets the maximum amount of time a connection may
+	// be reused. Expired connections may be closed lazily before reuse.
+	// If d < 0, connections are not closed due to a connection's age.
+	ConnMaxLifetime ConfigDuration
+
+	// ConnMaxIdleTime sets the maximum amount of time a connection may
+	// be idle. Expired connections may be closed lazily before reuse.
+	// If d < 0, connections are not closed due to a connection's idle
+	// time.
+	ConnMaxIdleTime ConfigDuration
 }
 
 // URL returns the DBConnect URL represented by this DBConfig object, either
@@ -138,6 +164,11 @@ func (t *TLSConfig) Load() (*tls.Config, error) {
 		ClientCAs:    rootCAs,
 		ClientAuth:   tls.RequireAndVerifyClientCert,
 		Certificates: []tls.Certificate{cert},
+		// Set the only acceptable TLS version to 1.2 and the only acceptable cipher suite
+		// to ECDHE-RSA-CHACHA20-POLY1305.
+		MinVersion:   tls.VersionTLS12,
+		MaxVersion:   tls.VersionTLS12,
+		CipherSuites: []uint16{tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305},
 	}, nil
 }
 
@@ -171,7 +202,8 @@ func (d *ConfigDuration) UnmarshalJSON(b []byte) error {
 	s := ""
 	err := json.Unmarshal(b, &s)
 	if err != nil {
-		if _, ok := err.(*json.UnmarshalTypeError); ok {
+		var jsonUnmarshalTypeErr *json.UnmarshalTypeError
+		if errors.As(err, &jsonUnmarshalTypeErr) {
 			return ErrDurationMustBeString
 		}
 		return err
@@ -215,6 +247,12 @@ type GRPCServerConfig struct {
 	// (SANs). The server will reject clients that do not present a certificate
 	// with a SAN present on the `ClientNames` list.
 	ClientNames []string `json:"clientNames"`
+	// MaxConnectionAge specifies how long a connection may live before the server sends a GoAway to the
+	// client. Because gRPC connections re-resolve DNS after a connection close,
+	// this controls how long it takes before a client learns about changes to its
+	// backends.
+	// https://pkg.go.dev/google.golang.org/grpc/keepalive#ServerParameters
+	MaxConnectionAge ConfigDuration
 }
 
 // PortConfig specifies what ports the VA should call to on the remote
@@ -223,4 +261,69 @@ type PortConfig struct {
 	HTTPPort  int
 	HTTPSPort int
 	TLSPort   int
+}
+
+// BeelineConfig provides config options for the Honeycomb beeline-go library,
+// which are passed to its beeline.Init() method.
+type BeelineConfig struct {
+	// WriteKey is the API key needed to send data Honeycomb. This can be given
+	// directly in the JSON config for local development, or as a path to a
+	// separate file for production deployment.
+	WriteKey PasswordConfig
+	// Dataset is the event collection, e.g. Staging or Prod.
+	Dataset string
+	// SampleRate is the (positive integer) denominator of the sample rate.
+	// Default: 1 (meaning all traces are sent). Set higher to send fewer traces.
+	SampleRate uint32
+	// Mute disables honeycomb entirely; useful in test environments.
+	Mute bool
+	// Many other fields of beeline.Config are omitted as they are not yet used.
+}
+
+// makeSampler constructs a SamplerHook which will deterministically decide if
+// any given span should be sampled based on its TraceID, which is shared by all
+// spans within a trace. If a trace_id can't be found, the span will be sampled.
+// If the span is an autogenerated grpc_client span, it will never be sampled.
+// A sample rate of 0 defaults to a sample rate of 1 (i.e. all events are sent).
+func makeSampler(rate uint32) func(fields map[string]interface{}) (bool, int) {
+	if rate == 0 {
+		rate = 1
+	}
+	upperBound := math.MaxUint32 / rate
+
+	return func(fields map[string]interface{}) (bool, int) {
+		kind, ok := fields["meta.type"].(string)
+		if ok && kind == "grpc_client" {
+			return false, 0
+		}
+		id, ok := fields["trace.trace_id"].(string)
+		if !ok {
+			return true, 1
+		}
+		h := fnv.New32()
+		h.Write([]byte(id))
+		return h.Sum32() < upperBound, int(rate)
+	}
+}
+
+// Load converts a BeelineConfig to a beeline.Config, loading the api WriteKey
+// and setting the ServiceName automatically.
+func (bc *BeelineConfig) Load() (beeline.Config, error) {
+	exec, err := os.Executable()
+	if err != nil {
+		return beeline.Config{}, fmt.Errorf("failed to get executable name: %w", err)
+	}
+
+	writekey, err := bc.WriteKey.Pass()
+	if err != nil {
+		return beeline.Config{}, fmt.Errorf("failed to get write key: %w", err)
+	}
+
+	return beeline.Config{
+		WriteKey:    writekey,
+		Dataset:     bc.Dataset,
+		ServiceName: path.Base(exec),
+		SamplerHook: makeSampler(bc.SampleRate),
+		Mute:        bc.Mute,
+	}, nil
 }

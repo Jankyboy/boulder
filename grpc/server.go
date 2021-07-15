@@ -5,12 +5,14 @@ import (
 	"errors"
 	"net"
 
-	"github.com/grpc-ecosystem/go-grpc-prometheus"
+	grpc_prometheus "github.com/grpc-ecosystem/go-grpc-prometheus"
+	"github.com/honeycombio/beeline-go/wrappers/hnygrpc"
 	"github.com/jmhodges/clock"
 	"github.com/letsencrypt/boulder/cmd"
 	bcreds "github.com/letsencrypt/boulder/grpc/creds"
 	"github.com/prometheus/client_golang/prometheus"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/keepalive"
 )
 
 // CodedError is a alias required to appease go vet
@@ -22,7 +24,7 @@ var errNilTLS = errors.New("boulder/grpc: received nil tls.Config")
 // verifies that clients present a certificate that (a) is signed by one of
 // the configured ClientCAs, and (b) contains at least one
 // subjectAlternativeName matching the accepted list from GRPCServerConfig.
-func NewServer(c *cmd.GRPCServerConfig, tlsConfig *tls.Config, metrics serverMetrics, clk clock.Clock) (*grpc.Server, net.Listener, error) {
+func NewServer(c *cmd.GRPCServerConfig, tlsConfig *tls.Config, metrics serverMetrics, clk clock.Clock, interceptors ...grpc.UnaryServerInterceptor) (*grpc.Server, net.Listener, error) {
 	if tlsConfig == nil {
 		return nil, nil, errNilTLS
 	}
@@ -30,11 +32,6 @@ func NewServer(c *cmd.GRPCServerConfig, tlsConfig *tls.Config, metrics serverMet
 	for _, name := range c.ClientNames {
 		acceptedSANs[name] = struct{}{}
 	}
-
-	// Set the only acceptable TLS version to 1.2 and the only acceptable cipher suite
-	// to ECDHE-RSA-CHACHA20-POLY1305.
-	tlsConfig.MinVersion, tlsConfig.MaxVersion = tls.VersionTLS12, tls.VersionTLS12
-	tlsConfig.CipherSuites = []uint16{tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305}
 
 	creds, err := bcreds.NewServerCredentials(tlsConfig, acceptedSANs)
 	if err != nil {
@@ -47,10 +44,23 @@ func NewServer(c *cmd.GRPCServerConfig, tlsConfig *tls.Config, metrics serverMet
 	}
 
 	si := newServerInterceptor(metrics, clk)
-	return grpc.NewServer(
+	allInterceptors := []grpc.UnaryServerInterceptor{
+		si.intercept,
+		si.metrics.grpcMetrics.UnaryServerInterceptor(),
+		hnygrpc.UnaryServerInterceptor(),
+	}
+	allInterceptors = append(allInterceptors, interceptors...)
+	options := []grpc.ServerOption{
 		grpc.Creds(creds),
-		grpc.UnaryInterceptor(si.intercept),
-	), l, nil
+		grpc.ChainUnaryInterceptor(allInterceptors...),
+	}
+	if c.MaxConnectionAge.Duration > 0 {
+		options = append(options,
+			grpc.KeepaliveParams(keepalive.ServerParameters{
+				MaxConnectionAge: c.MaxConnectionAge.Duration,
+			}))
+	}
+	return grpc.NewServer(options...), l, nil
 }
 
 // serverMetrics is a struct type used to return a few registered metrics from

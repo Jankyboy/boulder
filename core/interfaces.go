@@ -7,16 +7,14 @@ import (
 	"net/http"
 	"time"
 
+	"google.golang.org/protobuf/types/known/emptypb"
 	jose "gopkg.in/square/go-jose.v2"
 
-	capb "github.com/letsencrypt/boulder/ca/proto"
 	corepb "github.com/letsencrypt/boulder/core/proto"
 	"github.com/letsencrypt/boulder/identifier"
-	pubpb "github.com/letsencrypt/boulder/publisher/proto"
 	rapb "github.com/letsencrypt/boulder/ra/proto"
 	"github.com/letsencrypt/boulder/revocation"
 	sapb "github.com/letsencrypt/boulder/sa/proto"
-	vapb "github.com/letsencrypt/boulder/va/proto"
 )
 
 // A WebFrontEnd object supplies methods that can be hooked into
@@ -59,25 +57,25 @@ type WebFrontEnd interface {
 // RegistrationAuthority defines the public interface for the Boulder RA
 type RegistrationAuthority interface {
 	// [WebFrontEnd]
-	NewRegistration(ctx context.Context, reg Registration) (Registration, error)
+	NewRegistration(ctx context.Context, reg *corepb.Registration) (*corepb.Registration, error)
 
 	// [WebFrontEnd]
 	NewAuthorization(ctx context.Context, authz Authorization, regID int64) (Authorization, error)
 
 	// [WebFrontEnd]
-	NewCertificate(ctx context.Context, csr CertificateRequest, regID int64) (Certificate, error)
+	NewCertificate(ctx context.Context, csr CertificateRequest, regID int64, issuerNameID int64) (Certificate, error)
 
 	// [WebFrontEnd]
-	UpdateRegistration(ctx context.Context, base, updates Registration) (Registration, error)
+	UpdateRegistration(ctx context.Context, req *rapb.UpdateRegistrationRequest) (*corepb.Registration, error)
 
 	// [WebFrontEnd]
 	PerformValidation(ctx context.Context, req *rapb.PerformValidationRequest) (*corepb.Authorization, error)
 
 	// [WebFrontEnd]
-	RevokeCertificateWithReg(ctx context.Context, cert x509.Certificate, code revocation.Reason, regID int64) error
+	RevokeCertificateWithReg(ctx context.Context, req *rapb.RevokeCertificateWithRegRequest) (*emptypb.Empty, error)
 
 	// [WebFrontEnd]
-	DeactivateRegistration(ctx context.Context, reg Registration) error
+	DeactivateRegistration(ctx context.Context, reg *corepb.Registration) (*emptypb.Empty, error)
 
 	// [WebFrontEnd]
 	DeactivateAuthorization(ctx context.Context, auth Authorization) error
@@ -90,21 +88,6 @@ type RegistrationAuthority interface {
 
 	// [AdminRevoker]
 	AdministrativelyRevokeCertificate(ctx context.Context, cert x509.Certificate, code revocation.Reason, adminName string) error
-}
-
-// ValidationAuthority defines the public interface for the Boulder VA
-// TODO(#4956): Remove this unnecessary type alias.
-type ValidationAuthority vapb.VAServer
-
-// CertificateAuthority defines the public interface for the Boulder CA
-type CertificateAuthority interface {
-	// [RegistrationAuthority]
-	IssuePrecertificate(ctx context.Context, issueReq *capb.IssueCertificateRequest) (*capb.IssuePrecertificateResponse, error)
-
-	// [RegistrationAuthority]
-	IssueCertificateForPrecertificate(ctx context.Context, req *capb.IssueCertificateForPrecertificateRequest) (*corepb.Certificate, error)
-
-	GenerateOCSP(ctx context.Context, ocspReq *capb.GenerateOCSPRequest) (*capb.OCSPResponse, error)
 }
 
 // PolicyAuthority defines the public interface for the Boulder PA
@@ -147,8 +130,8 @@ type StorageAdder interface {
 	NewRegistration(ctx context.Context, reg Registration) (created Registration, err error)
 	UpdateRegistration(ctx context.Context, reg Registration) error
 	AddCertificate(ctx context.Context, der []byte, regID int64, ocsp []byte, issued *time.Time) (digest string, err error)
-	AddPrecertificate(ctx context.Context, req *sapb.AddCertificateRequest) (*corepb.Empty, error)
-	AddSerial(ctx context.Context, req *sapb.AddSerialRequest) (*corepb.Empty, error)
+	AddPrecertificate(ctx context.Context, req *sapb.AddCertificateRequest) (*emptypb.Empty, error)
+	AddSerial(ctx context.Context, req *sapb.AddSerialRequest) (*emptypb.Empty, error)
 	DeactivateRegistration(ctx context.Context, id int64) error
 	NewOrder(ctx context.Context, order *corepb.Order) (*corepb.Order, error)
 	SetOrderProcessing(ctx context.Context, order *corepb.Order) error
@@ -158,8 +141,8 @@ type StorageAdder interface {
 	// New authz2 methods
 	NewAuthorizations2(ctx context.Context, req *sapb.AddPendingAuthorizationsRequest) (*sapb.Authorization2IDs, error)
 	FinalizeAuthorization2(ctx context.Context, req *sapb.FinalizeAuthorizationRequest) error
-	DeactivateAuthorization2(ctx context.Context, req *sapb.AuthorizationID2) (*corepb.Empty, error)
-	AddBlockedKey(ctx context.Context, req *sapb.AddBlockedKeyRequest) (*corepb.Empty, error)
+	DeactivateAuthorization2(ctx context.Context, req *sapb.AuthorizationID2) (*emptypb.Empty, error)
+	AddBlockedKey(ctx context.Context, req *sapb.AddBlockedKeyRequest) (*emptypb.Empty, error)
 }
 
 // StorageAuthority interface represents a simple key/value
@@ -168,9 +151,4 @@ type StorageAdder interface {
 type StorageAuthority interface {
 	StorageGetter
 	StorageAdder
-}
-
-// Publisher defines the public interface for the Boulder Publisher
-type Publisher interface {
-	SubmitToSingleCTWithResult(ctx context.Context, req *pubpb.Request) (*pubpb.Result, error)
 }

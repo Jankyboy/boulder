@@ -12,14 +12,10 @@ type FeatureFlag int
 const (
 	unused FeatureFlag = iota // unused is used for testing
 	//   Deprecated features, these can be removed once stripped from production configs
-	WriteIssuedNamesPrecert
-	HeadNonceStatusOK
-	RemoveWFE2AccountID
-	CheckRenewalFirst
-	ParallelCheckFailedValidation
-	DeleteUnusedChallenges
-	BlockedKeyTable
-	StoreKeyHashes
+	PrecertificateRevocation
+	StripDefaultSchemePort
+	NonCFSSLSigner
+	StoreIssuerInfo
 
 	//   Currently in-use features
 	// Check CAA and respect validationmethods parameter.
@@ -40,15 +36,6 @@ const (
 	// V1DisableNewValidations disables validations for new domain names in the V1
 	// API.
 	V1DisableNewValidations
-	// PrecertificateRevocation allows revocation of precertificates with the
-	// ACMEv2 interface.
-	PrecertificateRevocation
-	// StripDefaultSchemePort enables stripping of default scheme ports from HTTP
-	// request Host headers
-	StripDefaultSchemePort
-	// StoreIssuerInfo enables storage of information identifying the issuer of
-	// a certificate in the certificateStatus table.
-	StoreIssuerInfo
 	// StoreRevokerInfo enables storage of the revoker and a bool indicating if the row
 	// was checked for extant unrevoked certificates in the blockedKeys table.
 	StoreRevokerInfo
@@ -58,36 +45,29 @@ const (
 	// FasterNewOrdersRateLimit enables use of a separate table for counting the
 	// new orders rate limit.
 	FasterNewOrdersRateLimit
-	// NonCFSSLSigner enables usage of our own certificate signer instead of the
-	// CFSSL signer.
-	NonCFSSLSigner
+	// ECDSAForAll enables all accounts, regardless of their presence in the CA's
+	// ecdsaAllowedAccounts config value, to get issuance from ECDSA issuers.
+	ECDSAForAll
 )
 
 // List of features and their default value, protected by fMu
 var features = map[FeatureFlag]bool{
-	unused:                        false,
-	CAAValidationMethods:          false,
-	CAAAccountURI:                 false,
-	HeadNonceStatusOK:             false,
-	EnforceMultiVA:                false,
-	MultiVAFullResults:            false,
-	RemoveWFE2AccountID:           false,
-	CheckRenewalFirst:             false,
-	MandatoryPOSTAsGET:            false,
-	AllowV1Registration:           true,
-	ParallelCheckFailedValidation: false,
-	DeleteUnusedChallenges:        false,
-	V1DisableNewValidations:       false,
-	PrecertificateRevocation:      false,
-	StripDefaultSchemePort:        false,
-	StoreIssuerInfo:               false,
-	WriteIssuedNamesPrecert:       false,
-	StoreKeyHashes:                false,
-	StoreRevokerInfo:              false,
-	RestrictRSAKeySizes:           false,
-	FasterNewOrdersRateLimit:      false,
-	BlockedKeyTable:               false,
-	NonCFSSLSigner:                false,
+	unused:                   false,
+	CAAValidationMethods:     false,
+	CAAAccountURI:            false,
+	EnforceMultiVA:           false,
+	MultiVAFullResults:       false,
+	MandatoryPOSTAsGET:       false,
+	AllowV1Registration:      true,
+	V1DisableNewValidations:  false,
+	PrecertificateRevocation: false,
+	StripDefaultSchemePort:   false,
+	StoreIssuerInfo:          false,
+	StoreRevokerInfo:         false,
+	RestrictRSAKeySizes:      false,
+	FasterNewOrdersRateLimit: false,
+	NonCFSSLSigner:           false,
+	ECDSAForAll:              false,
 }
 
 var fMu = new(sync.RWMutex)

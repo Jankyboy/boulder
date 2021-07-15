@@ -83,25 +83,35 @@ func TestAddPrecertificate(t *testing.T) {
 			// AddCertificate not AddPrecertificate will be updating this table.
 			test.AssertEquals(t, db.IsNoRows(err), true)
 		}
-
-		// Adding the same certificate with the same serial should result in an
-		// error
-		_, err = sa.AddPrecertificate(ctx, &sapb.AddCertificateRequest{
-			Der:      testCert.Raw,
-			RegID:    regID,
-			Ocsp:     ocspResp,
-			Issued:   issuedTime.UnixNano(),
-			IssuerID: 1,
-		})
-		if err == nil {
-			t.Fatalf("Expected error inserting duplicate precertificate, got none")
-		}
-		if !berrors.Is(err, berrors.Duplicate) {
-			t.Fatalf("Expected berrors.Duplicate inserting duplicate precertificate, got %#v", err)
-		}
 	}
 
 	addPrecert(true)
+}
+
+func TestAddPreCertificateDuplicate(t *testing.T) {
+	sa, clk, cleanUp := initSA(t)
+	defer cleanUp()
+
+	reg := satest.CreateWorkingRegistration(t, sa)
+
+	_, testCert := test.ThrowAwayCert(t, 1)
+
+	_, err := sa.AddPrecertificate(ctx, &sapb.AddCertificateRequest{
+		Der:      testCert.Raw,
+		Issued:   clk.Now().UnixNano(),
+		RegID:    reg.ID,
+		IssuerID: 1,
+	})
+	test.AssertNotError(t, err, "Couldn't add test certificate")
+
+	_, err = sa.AddPrecertificate(ctx, &sapb.AddCertificateRequest{
+		Der:      testCert.Raw,
+		Issued:   clk.Now().UnixNano(),
+		RegID:    reg.ID,
+		IssuerID: 1,
+	})
+	test.AssertDeepEquals(t, err, berrors.DuplicateError("cannot add a duplicate cert"))
+
 }
 
 func TestAddPrecertificateIncomplete(t *testing.T) {

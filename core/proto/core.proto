@@ -12,6 +12,7 @@ message Challenge {
   string keyAuthorization = 5;
   repeated ValidationRecord validationrecords = 10;
   ProblemDetails error = 7;
+  int64 validated = 11;
 }
 
 message ValidationRecord {
@@ -91,5 +92,3 @@ message Order {
   int64 created = 10;
   repeated int64 v2Authorizations = 11;
 }
-
-message Empty {}

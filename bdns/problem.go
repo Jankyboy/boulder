@@ -8,8 +8,8 @@ import (
 	"github.com/miekg/dns"
 )
 
-// DNSError wraps a DNS error with various relevant information
-type DNSError struct {
+// Error wraps a DNS error with various relevant information
+type Error struct {
 	recordType uint16
 	hostname   string
 	// Exactly one of rCode or underlying should be set.
@@ -17,11 +17,7 @@ type DNSError struct {
 	rCode      int
 }
 
-func (d DNSError) Underlying() error {
-	return d.underlying
-}
-
-func (d DNSError) Error() string {
+func (d Error) Error() string {
 	var detail, additional string
 	if d.underlying != nil {
 		if netErr, ok := d.underlying.(*net.OpError); ok {
@@ -32,8 +28,10 @@ func (d DNSError) Error() string {
 			}
 			// Note: we check d.underlying here even though `Timeout()` does this because the call to `netErr.Timeout()` above only
 			// happens for `*net.OpError` underlying types!
-		} else if d.underlying == context.Canceled || d.underlying == context.DeadlineExceeded {
+		} else if d.underlying == context.DeadlineExceeded {
 			detail = detailDNSTimeout
+		} else if d.underlying == context.Canceled {
+			detail = detailCanceled
 		} else {
 			detail = detailServerFailure
 		}
@@ -49,17 +47,8 @@ func (d DNSError) Error() string {
 		dns.TypeToString[d.recordType], d.hostname, additional)
 }
 
-// Timeout returns true if the underlying error was a timeout
-func (d DNSError) Timeout() bool {
-	if netErr, ok := d.underlying.(*net.OpError); ok {
-		return netErr.Timeout()
-	} else if d.underlying == context.Canceled || d.underlying == context.DeadlineExceeded {
-		return true
-	}
-	return false
-}
-
 const detailDNSTimeout = "query timed out"
+const detailCanceled = "query timed out (and was canceled)"
 const detailDNSNetFailure = "networking error"
 const detailServerFailure = "server failure at resolver"
 

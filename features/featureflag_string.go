@@ -9,33 +9,26 @@ func _() {
 	// Re-run the stringer command to generate them again.
 	var x [1]struct{}
 	_ = x[unused-0]
-	_ = x[WriteIssuedNamesPrecert-1]
-	_ = x[HeadNonceStatusOK-2]
-	_ = x[RemoveWFE2AccountID-3]
-	_ = x[CheckRenewalFirst-4]
-	_ = x[ParallelCheckFailedValidation-5]
-	_ = x[DeleteUnusedChallenges-6]
-	_ = x[BlockedKeyTable-7]
-	_ = x[StoreKeyHashes-8]
-	_ = x[CAAValidationMethods-9]
-	_ = x[CAAAccountURI-10]
-	_ = x[EnforceMultiVA-11]
-	_ = x[MultiVAFullResults-12]
-	_ = x[MandatoryPOSTAsGET-13]
-	_ = x[AllowV1Registration-14]
-	_ = x[V1DisableNewValidations-15]
-	_ = x[PrecertificateRevocation-16]
-	_ = x[StripDefaultSchemePort-17]
-	_ = x[StoreIssuerInfo-18]
-	_ = x[StoreRevokerInfo-19]
-	_ = x[RestrictRSAKeySizes-20]
-	_ = x[FasterNewOrdersRateLimit-21]
-	_ = x[NonCFSSLSigner-22]
+	_ = x[PrecertificateRevocation-1]
+	_ = x[StripDefaultSchemePort-2]
+	_ = x[NonCFSSLSigner-3]
+	_ = x[StoreIssuerInfo-4]
+	_ = x[CAAValidationMethods-5]
+	_ = x[CAAAccountURI-6]
+	_ = x[EnforceMultiVA-7]
+	_ = x[MultiVAFullResults-8]
+	_ = x[MandatoryPOSTAsGET-9]
+	_ = x[AllowV1Registration-10]
+	_ = x[V1DisableNewValidations-11]
+	_ = x[StoreRevokerInfo-12]
+	_ = x[RestrictRSAKeySizes-13]
+	_ = x[FasterNewOrdersRateLimit-14]
+	_ = x[ECDSAForAll-15]
 }
 
-const _FeatureFlag_name = "unusedWriteIssuedNamesPrecertHeadNonceStatusOKRemoveWFE2AccountIDCheckRenewalFirstParallelCheckFailedValidationDeleteUnusedChallengesBlockedKeyTableStoreKeyHashesCAAValidationMethodsCAAAccountURIEnforceMultiVAMultiVAFullResultsMandatoryPOSTAsGETAllowV1RegistrationV1DisableNewValidationsPrecertificateRevocationStripDefaultSchemePortStoreIssuerInfoStoreRevokerInfoRestrictRSAKeySizesFasterNewOrdersRateLimitNonCFSSLSigner"
+const _FeatureFlag_name = "unusedPrecertificateRevocationStripDefaultSchemePortNonCFSSLSignerStoreIssuerInfoCAAValidationMethodsCAAAccountURIEnforceMultiVAMultiVAFullResultsMandatoryPOSTAsGETAllowV1RegistrationV1DisableNewValidationsStoreRevokerInfoRestrictRSAKeySizesFasterNewOrdersRateLimitECDSAForAll"
 
-var _FeatureFlag_index = [...]uint16{0, 6, 29, 46, 65, 82, 111, 133, 148, 162, 182, 195, 209, 227, 245, 264, 287, 311, 333, 348, 364, 383, 407, 421}
+var _FeatureFlag_index = [...]uint16{0, 6, 30, 52, 66, 81, 101, 114, 128, 146, 164, 183, 206, 222, 241, 265, 276}
 
 func (i FeatureFlag) String() string {
 	if i < 0 || i >= FeatureFlag(len(_FeatureFlag_index)-1) {

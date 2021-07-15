@@ -3,6 +3,7 @@ package va
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -414,18 +415,10 @@ func fallbackErr(err error) bool {
 	if err == nil {
 		return false
 	}
-
-	switch err := err.(type) {
-	case *url.Error:
-		// URL Errors should be unwrapped and tested
-		return fallbackErr(err.Err)
-	case *net.OpError:
-		// Net OpErrors are fallback errs only if the operation was a "dial"
-		return err.Op == "dial"
-	default:
-		// All other errs are not fallback errs
-		return false
-	}
+	// Net OpErrors are fallback errs only if the operation was a "dial"
+	// All other errs are not fallback errs
+	var netOpError *net.OpError
+	return errors.As(err, &netOpError) && netOpError.Op == "dial"
 }
 
 // processHTTPValidation performs an HTTP validation for the given host, port
@@ -512,6 +505,11 @@ func (va *ValidationAuthorityImpl) processHTTPValidation(
 		numRedirects++
 		va.metrics.http01Redirects.Inc()
 
+		// If the response contains an HTTP 303 redirect, do not follow.
+		if req.Response.StatusCode == 303 {
+			return berrors.ConnectionFailureError("Cannot follow HTTP 303 redirects")
+		}
+
 		// Lowercase the redirect host immediately, as the dialer and redirect
 		// validation expect it to have been lowercased already.
 		req.URL.Host = strings.ToLower(req.URL.Host)
@@ -535,6 +533,14 @@ func (va *ValidationAuthorityImpl) processHTTPValidation(
 			redirQuery = req.URL.RawQuery
 		}
 
+		// Check for a redirect loop. If any URL is found twice before the
+		// redirect limit, return error.
+		for _, record := range records {
+			if req.URL.String() == record.URL {
+				return berrors.ConnectionFailureError("Redirect loop detected")
+			}
+		}
+
 		// Create a validation target for the redirect host. This will resolve IP
 		// addresses for the host explicitly.
 		redirTarget, err := va.newHTTPValidationTarget(ctx, redirHost, redirPort, redirPath, redirQuery)
@@ -550,6 +556,7 @@ func (va *ValidationAuthorityImpl) processHTTPValidation(
 		if err != nil {
 			return err
 		}
+
 		va.log.Debugf("following redirect to host %q url %q", req.Host, req.URL.String())
 		// Replace the transport's DialContext with the new preresolvedDialer for
 		// the redirect.
@@ -614,7 +621,7 @@ func (va *ValidationAuthorityImpl) processHTTPValidation(
 	// resulting payload is the same size as maxResponseSize fail
 	if len(body) >= maxResponseSize {
 		return nil, records, berrors.UnauthorizedError("Invalid response from %s [%s]: %q",
-			records[len(records)-1].URL, records[len(records)-1].AddressUsed, body)
+			records[len(records)-1].URL, records[len(records)-1].AddressUsed, replaceInvalidUTF8(body))
 	}
 	if httpResponse.StatusCode != 200 {
 		return nil, records, berrors.UnauthorizedError("Invalid response from %s [%s]: %d",

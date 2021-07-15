@@ -13,12 +13,14 @@ import (
 	"os"
 	"time"
 
+	"github.com/honeycombio/beeline-go"
 	"github.com/jmhodges/clock"
 	"github.com/letsencrypt/boulder/cmd"
 	"github.com/letsencrypt/boulder/core"
 	"github.com/letsencrypt/boulder/features"
 	"github.com/letsencrypt/boulder/goodkey"
 	bgrpc "github.com/letsencrypt/boulder/grpc"
+	"github.com/letsencrypt/boulder/issuance"
 	blog "github.com/letsencrypt/boulder/log"
 	noncepb "github.com/letsencrypt/boulder/nonce/proto"
 	rapb "github.com/letsencrypt/boulder/ra/proto"
@@ -59,11 +61,28 @@ type config struct {
 		// CertificateChains maps AIA issuer URLs to certificate filenames.
 		// Certificates are read into the chain in the order they are defined in the
 		// slice of filenames.
+		// DEPRECATED: See Chains, below.
+		// TODO(5164): Remove this after all configs have migrated to `Chains`.
 		CertificateChains map[string][]string
 
 		// AlternateCertificateChains maps AIA issuer URLs to an optional alternate
 		// certificate chain, represented by an ordered slice of certificate filenames.
+		// DEPRECATED: See Chains, below.
+		// TODO(5164): Remove this after all configs have migrated to `Chains`.
 		AlternateCertificateChains map[string][]string
+
+		// Chains is a list of lists of certificate filenames. Each inner list is
+		// a chain (starting with the issuing intermediate, followed by one or
+		// more additional certificates, up to and including a root) which we are
+		// willing to serve. Chains that start with a given intermediate will only
+		// be offered for certificates which were issued by the key pair represented
+		// by that intermediate. The first chain representing any given issuing
+		// key pair will be the default for that issuer, served if the client does
+		// not request a specific chain.
+		// NOTE: This config field deprecates the CertificateChains and
+		// AlternateCertificateChains fields. If it is present, those fields are
+		// ignored. They will be removed in a future release.
+		Chains [][]string
 
 		Features map[string]bool
 
@@ -105,20 +124,18 @@ type config struct {
 		PendingAuthorizationLifetimeDays int
 	}
 
-	Syslog cmd.SyslogConfig
-
-	Common struct {
-		IssuerCert string
-	}
+	Syslog  cmd.SyslogConfig
+	Beeline cmd.BeelineConfig
 }
 
 // loadCertificateFile loads a PEM certificate from the certFile provided. It
 // validates that the PEM is well-formed with no leftover bytes, and contains
-// only a well-formed X509 certificate. If the cert file meets these
+// only a well-formed X509 CA certificate. If the cert file meets these
 // requirements the PEM bytes from the file are returned along with the parsed
 // certificate, otherwise an error is returned. If the PEM contents of
 // a certFile do not have a trailing newline one is added.
-func loadCertificateFile(aiaIssuerURL, certFile string) ([]byte, *x509.Certificate, error) {
+// TODO(5164): Remove this after all configs have migrated to `Chains`.
+func loadCertificateFile(aiaIssuerURL, certFile string) ([]byte, *issuance.Certificate, error) {
 	pemBytes, err := ioutil.ReadFile(certFile)
 	if err != nil {
 		return nil, nil, fmt.Errorf(
@@ -169,19 +186,20 @@ func loadCertificateFile(aiaIssuerURL, certFile string) ([]byte, *x509.Certifica
 	if pemBytes[len(pemBytes)-1] != '\n' {
 		pemBytes = append(pemBytes, '\n')
 	}
-	return pemBytes, cert, nil
+	return pemBytes, &issuance.Certificate{Certificate: cert}, nil
 }
 
 // loadCertificateChains processes the provided chainConfig of AIA Issuer URLs
 // and cert filenames. For each AIA issuer URL all of its cert filenames are
 // read, validated as PEM certificates, and concatenated together separated by
 // newlines. The combined PEM certificate chain contents for each are returned
-// in the results map, keyed by the AIA Issuer URL. Additionally the first
+// in the results map, keyed by the IssuerNameID. Additionally the first
 // certificate in each chain is parsed and returned in a slice of issuer
 // certificates.
-func loadCertificateChains(chainConfig map[string][]string, requireAtLeastOneChain bool) (map[string][]byte, []*x509.Certificate, error) {
-	results := make(map[string][]byte, len(chainConfig))
-	var issuerCerts []*x509.Certificate
+// TODO(5164): Remove this after all configs have migrated to `Chains`.
+func loadCertificateChains(chainConfig map[string][]string, requireAtLeastOneChain bool) (map[issuance.IssuerNameID][]byte, map[issuance.IssuerNameID]*issuance.Certificate, error) {
+	results := make(map[issuance.IssuerNameID][]byte, len(chainConfig))
+	issuerCerts := make(map[issuance.IssuerNameID]*issuance.Certificate, len(chainConfig))
 
 	// For each AIA Issuer URL we need to read the chain cert files
 	for aiaIssuerURL, certFiles := range chainConfig {
@@ -197,6 +215,7 @@ func loadCertificateChains(chainConfig map[string][]string, requireAtLeastOneCha
 
 		// certFiles are read and appended in the order they appear in the
 		// configuration
+		var id issuance.IssuerNameID
 		for i, c := range certFiles {
 			// Prepend a newline before each chain entry
 			buffer.Write([]byte("\n"))
@@ -209,7 +228,8 @@ func loadCertificateChains(chainConfig map[string][]string, requireAtLeastOneCha
 
 			// Save the first certificate as a direct issuer certificate
 			if i == 0 {
-				issuerCerts = append(issuerCerts, cert)
+				id = cert.NameID()
+				issuerCerts[id] = cert
 			}
 
 			// Write the PEM bytes to the result buffer for this AIAIssuer
@@ -218,11 +238,32 @@ func loadCertificateChains(chainConfig map[string][]string, requireAtLeastOneCha
 
 		// Save the full PEM chain contents, if any
 		if buffer.Len() > 0 {
-			results[aiaIssuerURL] = buffer.Bytes()
+			results[id] = buffer.Bytes()
 		}
 	}
 
 	return results, issuerCerts, nil
+}
+
+// loadChain takes a list of filenames containing pem-formatted certificates,
+// and returns a chain representing all of those certificates in order. It
+// ensures that the resulting chain is valid. The final file is expected to be
+// a root certificate, which the chain will be verified against, but which will
+// not be included in the resulting chain.
+func loadChain(certFiles []string) (*issuance.Certificate, []byte, error) {
+	certs, err := issuance.LoadChain(certFiles)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// Iterate over all certs appending their pem to the buf.
+	var buf bytes.Buffer
+	for _, cert := range certs {
+		buf.Write([]byte("\n"))
+		buf.Write(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: cert.Raw}))
+	}
+
+	return certs[0], buf.Bytes(), nil
 }
 
 func setupWFE(c config, logger blog.Logger, stats prometheus.Registerer, clk clock.Clock) (core.RegistrationAuthority, core.StorageAuthority, noncepb.NonceServiceClient, map[string]noncepb.NonceServiceClient) {
@@ -282,33 +323,53 @@ func main() {
 	err := cmd.ReadConfigFile(*configFile, &c)
 	cmd.FailOnError(err, "Reading JSON config file into config structure")
 
-	// Map of AIA Issuer URLs to a slice of PEM-encoded certificate chains.
-	// The first chain in the slice is the default chain, and subsequent
-	// chains are alternates.
-	allCertChains := make(map[string][][]byte, len(c.WFE.CertificateChains))
-
-	certChains, issuerCerts, err := loadCertificateChains(c.WFE.CertificateChains, true)
-	cmd.FailOnError(err, "Couldn't read configured CertificateChains")
-
-	for aiaURL, chainPEM := range certChains {
-		allCertChains[aiaURL] = [][]byte{chainPEM}
-	}
-
 	err = features.Set(c.WFE.Features)
 	cmd.FailOnError(err, "Failed to set feature flags")
 
-	if c.WFE.AlternateCertificateChains != nil {
-		altCertChains, _, err := loadCertificateChains(c.WFE.AlternateCertificateChains, false)
-		cmd.FailOnError(err, "Couldn't read configured AlternateCertificateChains")
+	allCertChains := map[issuance.IssuerNameID][][]byte{}
+	issuerCerts := map[issuance.IssuerNameID]*issuance.Certificate{}
+	if c.WFE.Chains != nil {
+		for _, files := range c.WFE.Chains {
+			issuer, chain, err := loadChain(files)
+			cmd.FailOnError(err, "Failed to load chain")
 
-		for aiaURL, chainPEM := range altCertChains {
-			if _, ok := allCertChains[aiaURL]; !ok {
-				cmd.Fail(fmt.Sprintf("AIA Issuer URL %s appeared in AlternateCertificateChains, "+
-					"but does not exist in CertificateChains", aiaURL))
+			id := issuer.NameID()
+			allCertChains[id] = append(allCertChains[id], chain)
+			// This may overwrite a previously-set issuerCert (e.g. if there are two
+			// chains for the same issuer, but with different versions of the same
+			// same intermediate issued by different roots). This is okay, as the
+			// only truly important content here is the public key to verify other
+			// certs.
+			issuerCerts[id] = issuer
+		}
+	} else {
+		// TODO(5164): Remove this after all configs have migrated to `Chains`.
+		var certChains map[issuance.IssuerNameID][]byte
+		certChains, issuerCerts, err = loadCertificateChains(c.WFE.CertificateChains, true)
+		cmd.FailOnError(err, "Couldn't read configured CertificateChains")
+
+		for nameID, chainPEM := range certChains {
+			allCertChains[nameID] = [][]byte{chainPEM}
+		}
+
+		if c.WFE.AlternateCertificateChains != nil {
+			altCertChains, _, err := loadCertificateChains(c.WFE.AlternateCertificateChains, false)
+			cmd.FailOnError(err, "Couldn't read configured AlternateCertificateChains")
+
+			for nameID, chainPEM := range altCertChains {
+				if _, ok := allCertChains[nameID]; !ok {
+					cmd.Fail(fmt.Sprintf("IssuerNameId %q appeared in AlternateCertificateChains, "+
+						"but does not exist in CertificateChains", nameID))
+				}
+				allCertChains[nameID] = append(allCertChains[nameID], chainPEM)
 			}
-			allCertChains[aiaURL] = append(allCertChains[aiaURL], chainPEM)
 		}
 	}
+
+	bc, err := c.Beeline.Load()
+	cmd.FailOnError(err, "Failed to load Beeline config")
+	beeline.Init(bc)
+	defer beeline.Close()
 
 	stats, logger := cmd.StatsAndLogging(c.Syslog, c.WFE.DebugAddr)
 	defer logger.AuditPanic()
@@ -345,9 +406,6 @@ func main() {
 	wfe.DirectoryCAAIdentity = c.WFE.DirectoryCAAIdentity
 	wfe.DirectoryWebsite = c.WFE.DirectoryWebsite
 	wfe.LegacyKeyIDPrefix = c.WFE.LegacyKeyIDPrefix
-
-	wfe.IssuerCert, err = cmd.LoadCert(c.Common.IssuerCert)
-	cmd.FailOnError(err, fmt.Sprintf("Couldn't read issuer cert [%s]", c.Common.IssuerCert))
 
 	logger.Infof("WFE using key policy: %#v", kp)
 

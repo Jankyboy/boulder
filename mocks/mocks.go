@@ -7,14 +7,13 @@ import (
 	"errors"
 	"fmt"
 	"io/ioutil"
-	"math/big"
 	"net"
 	"strings"
-	"testing"
 	"time"
 
 	"github.com/jmhodges/clock"
-	"github.com/letsencrypt/boulder/test"
+	"google.golang.org/grpc"
+	"google.golang.org/protobuf/types/known/emptypb"
 	jose "gopkg.in/square/go-jose.v2"
 
 	"github.com/letsencrypt/boulder/core"
@@ -140,7 +139,8 @@ func (sa *StorageAuthority) GetRegistration(_ context.Context, id int64) (core.R
 	}
 
 	goodReg.InitialIP = net.ParseIP("5.6.7.8")
-	goodReg.CreatedAt = time.Date(2003, 9, 27, 0, 0, 0, 0, time.UTC)
+	createdAt := time.Date(2003, 9, 27, 0, 0, 0, 0, time.UTC)
+	goodReg.CreatedAt = &createdAt
 	return goodReg, nil
 }
 
@@ -302,13 +302,6 @@ func (sa *StorageAuthority) GetCertificate(_ context.Context, serial string) (co
 			DER:            certBlock.Bytes,
 			Issued:         sa.clk.Now().Add(-1 * time.Hour),
 		}, nil
-	} else if serial == "0000000000000000000000000000000000b3" {
-		_, cert := test.ThrowAwayCertWithSerial(&testing.T{}, 1, big.NewInt(0xb3))
-		return core.Certificate{
-			RegistrationID: 1,
-			DER:            cert.Raw,
-			Issued:         sa.clk.Now(),
-		}, nil
 	} else if serial == "000000000000000000000000000000626164" {
 		return core.Certificate{}, errors.New("bad")
 	} else {
@@ -338,12 +331,12 @@ func (sa *StorageAuthority) GetCertificateStatus(_ context.Context, serial strin
 }
 
 // AddPrecertificate is a mock
-func (sa *StorageAuthority) AddPrecertificate(ctx context.Context, req *sapb.AddCertificateRequest) (empty *corepb.Empty, err error) {
+func (sa *StorageAuthority) AddPrecertificate(ctx context.Context, req *sapb.AddCertificateRequest) (empty *emptypb.Empty, err error) {
 	return
 }
 
 // AddSerial is a mock
-func (sa *StorageAuthority) AddSerial(ctx context.Context, req *sapb.AddSerialRequest) (empty *corepb.Empty, err error) {
+func (sa *StorageAuthority) AddSerial(ctx context.Context, req *sapb.AddSerialRequest) (empty *emptypb.Empty, err error) {
 	return
 }
 
@@ -570,7 +563,7 @@ func (sa *StorageAuthority) FinalizeAuthorization2(ctx context.Context, req *sap
 	return nil
 }
 
-func (sa *StorageAuthority) DeactivateAuthorization2(ctx context.Context, req *sapb.AuthorizationID2) (*corepb.Empty, error) {
+func (sa *StorageAuthority) DeactivateAuthorization2(ctx context.Context, req *sapb.AuthorizationID2) (*emptypb.Empty, error) {
 	return nil, nil
 }
 
@@ -690,8 +683,8 @@ func (sa *StorageAuthority) RevokeCertificate(ctx context.Context, req *sapb.Rev
 }
 
 // AddBlockedKey is a mock
-func (sa *StorageAuthority) AddBlockedKey(context.Context, *sapb.AddBlockedKeyRequest) (*corepb.Empty, error) {
-	return &corepb.Empty{}, nil
+func (sa *StorageAuthority) AddBlockedKey(context.Context, *sapb.AddBlockedKeyRequest) (*emptypb.Empty, error) {
+	return &emptypb.Empty{}, nil
 }
 
 // KeyBlocked is a mock
@@ -700,12 +693,12 @@ func (sa *StorageAuthority) KeyBlocked(ctx context.Context, req *sapb.KeyBlocked
 }
 
 // Publisher is a mock
-type Publisher struct {
+type PublisherClient struct {
 	// empty
 }
 
 // SubmitToSingleCTWithResult is a mock
-func (*Publisher) SubmitToSingleCTWithResult(_ context.Context, _ *pubpb.Request) (*pubpb.Result, error) {
+func (*PublisherClient) SubmitToSingleCTWithResult(_ context.Context, _ *pubpb.Request, _ ...grpc.CallOption) (*pubpb.Result, error) {
 	return nil, nil
 }
 

@@ -8,10 +8,9 @@
       "tlsPort": 5001
     },
     "dnsTries": 3,
-    "dnsResolvers": [
-      "127.0.0.1:8053",
-      "127.0.0.1:8054"
-    ],
+    "dnsResolver": "boulder",
+    "dnsTimeout": "1s",
+    "dnsAllowLoopbackAddresses": true,
     "issuerDomain": "happy-hacker-ca.invalid",
     "tls": {
       "caCertfile": "test/grpc-creds/minica.pem",
@@ -19,8 +18,10 @@
       "keyFile": "test/grpc-creds/va.boulder/key.pem"
     },
     "grpc": {
+      "maxConnectionAge": "30s",
       "address": ":9098",
       "clientNames": [
+        "health-checker.boulder",
         "va.boulder"
       ]
     },
@@ -38,9 +39,8 @@
     "stdoutlevel": 6,
     "sysloglevel": 4
   },
-
-  "common": {
-    "dnsTimeout": "1s",
-    "dnsAllowLoopbackAddresses": true
+  "beeline": {
+      "mute": true,
+      "dataset": "Test"
   }
 }

@@ -16,6 +16,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/honeycombio/beeline-go"
 	"github.com/jmhodges/clock"
 	"github.com/letsencrypt/boulder/bdns"
 	"github.com/letsencrypt/boulder/canceled"
@@ -66,9 +67,10 @@ var (
 	h2SettingsFrameErrRegex = regexp.MustCompile(`(?:net\/http\: HTTP\/1\.x transport connection broken: )?malformed HTTP response \"\\x00\\x00\\x[a-f0-9]{2}\\x04\\x00\\x00\\x00\\x00\\x00.*"`)
 )
 
-// RemoteVA wraps the core.ValidationAuthority interface and adds a field containing the address
-// of the remote gRPC server since the interface (and the underlying gRPC client) doesn't
-// provide a way to extract this metadata which is useful for debugging gRPC connection issues.
+// RemoteVA wraps the vapb.VAClient interface and adds a field containing the
+// address of the remote gRPC server since the underlying gRPC client doesn't
+// provide a way to extract this metadata which is useful for debugging gRPC
+// connection issues.
 type RemoteVA struct {
 	vapb.VAClient
 	Address string
@@ -171,8 +173,10 @@ func initMetrics(stats prometheus.Registerer) *vaMetrics {
 
 // ValidationAuthorityImpl represents a VA
 type ValidationAuthorityImpl struct {
+	vapb.UnimplementedVAServer
+	vapb.UnimplementedCAAServer
 	log                blog.Logger
-	dnsClient          bdns.DNSClient
+	dnsClient          bdns.Client
 	issuerDomain       string
 	httpPort           int
 	httpsPort          int
@@ -190,7 +194,7 @@ type ValidationAuthorityImpl struct {
 // NewValidationAuthorityImpl constructs a new VA
 func NewValidationAuthorityImpl(
 	pc *cmd.PortConfig,
-	resolver bdns.DNSClient,
+	resolver bdns.Client,
 	remoteVAs []RemoteVA,
 	maxRemoteFailures int,
 	userAgent string,
@@ -254,47 +258,52 @@ type verificationRequestEvent struct {
 // passing through the detailed message.
 func detailedError(err error) *probs.ProblemDetails {
 	// net/http wraps net.OpError in a url.Error. Unwrap them.
-	if urlErr, ok := err.(*url.Error); ok {
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
 		prob := detailedError(urlErr.Err)
 		prob.Detail = fmt.Sprintf("Fetching %s: %s", urlErr.URL, prob.Detail)
 		return prob
 	}
 
-	if tlsErr, ok := err.(tls.RecordHeaderError); ok && bytes.Compare(tlsErr.RecordHeader[:], badTLSHeader) == 0 {
+	var tlsErr tls.RecordHeaderError
+	if errors.As(err, &tlsErr) && bytes.Compare(tlsErr.RecordHeader[:], badTLSHeader) == 0 {
 		return probs.Malformed("Server only speaks HTTP, not TLS")
 	}
 
-	var netErr *net.OpError
-	if errors.As(err, &netErr) {
-		if fmt.Sprintf("%T", netErr.Err) == "tls.alert" {
+	var netOpErr *net.OpError
+	if errors.As(err, &netOpErr) {
+		if fmt.Sprintf("%T", netOpErr.Err) == "tls.alert" {
 			// All the tls.alert error strings are reasonable to hand back to a
 			// user. Confirmed against Go 1.8.
-			return probs.TLSError(netErr.Error())
-		} else if syscallErr, ok := netErr.Err.(*os.SyscallError); ok &&
-			syscallErr.Err == syscall.ECONNREFUSED {
-			return probs.ConnectionFailure("Connection refused")
-		} else if syscallErr, ok := netErr.Err.(*os.SyscallError); ok &&
-			syscallErr.Err == syscall.ENETUNREACH {
-			return probs.ConnectionFailure("Network unreachable")
-		} else if syscallErr, ok := netErr.Err.(*os.SyscallError); ok &&
-			syscallErr.Err == syscall.ECONNRESET {
-			return probs.ConnectionFailure("Connection reset by peer")
-		} else if netErr.Timeout() && netErr.Op == "dial" {
+			return probs.TLSError(netOpErr.Error())
+		} else if netOpErr.Timeout() && netOpErr.Op == "dial" {
 			return probs.ConnectionFailure("Timeout during connect (likely firewall problem)")
-		} else if netErr.Timeout() {
-			return probs.ConnectionFailure(fmt.Sprintf("Timeout during %s (your server may be slow or overloaded)", netErr.Op))
+		} else if netOpErr.Timeout() {
+			return probs.ConnectionFailure(fmt.Sprintf("Timeout during %s (your server may be slow or overloaded)", netOpErr.Op))
 		}
 	}
-	if err, ok := err.(net.Error); ok && err.Timeout() {
+	var syscallErr *os.SyscallError
+	if errors.As(err, &syscallErr) {
+		switch syscallErr.Err {
+		case syscall.ECONNREFUSED:
+			return probs.ConnectionFailure("Connection refused")
+		case syscall.ENETUNREACH:
+			return probs.ConnectionFailure("Network unreachable")
+		case syscall.ECONNRESET:
+			return probs.ConnectionFailure("Connection reset by peer")
+		}
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
 		return probs.ConnectionFailure("Timeout after connect (your server may be slow or overloaded)")
 	}
-	if berrors.Is(err, berrors.ConnectionFailure) {
+	if errors.Is(err, berrors.ConnectionFailure) {
 		return probs.ConnectionFailure(err.Error())
 	}
-	if berrors.Is(err, berrors.Unauthorized) {
+	if errors.Is(err, berrors.Unauthorized) {
 		return probs.Unauthorized(err.Error())
 	}
-	if berrors.Is(err, berrors.DNS) {
+	if errors.Is(err, berrors.DNS) {
 		return probs.DNS(err.Error())
 	}
 
@@ -599,6 +608,9 @@ func (va *ValidationAuthorityImpl) PerformValidation(ctx context.Context, req *v
 		Requester: req.Authz.RegID,
 		Hostname:  req.Domain,
 	}
+	beeline.AddFieldToTrace(ctx, "authz.id", req.Authz.Id)
+	beeline.AddFieldToTrace(ctx, "acct.id", req.Authz.RegID)
+	beeline.AddFieldToTrace(ctx, "authz.dnsname", req.Domain)
 	vStart := va.clk.Now()
 
 	var remoteResults chan *remoteValidationResult
@@ -627,6 +639,7 @@ func (va *ValidationAuthorityImpl) PerformValidation(ctx context.Context, req *v
 		challenge.Status = core.StatusInvalid
 		challenge.Error = prob
 		logEvent.Error = prob.Error()
+		beeline.AddFieldToTrace(ctx, "challenge.error", prob.Error())
 	} else if remoteResults != nil {
 		if !features.Enabled(features.EnforceMultiVA) && features.Enabled(features.MultiVAFullResults) {
 			// If we're not going to enforce multi VA but we are logging the
@@ -660,6 +673,7 @@ func (va *ValidationAuthorityImpl) PerformValidation(ctx context.Context, req *v
 				challenge.Status = core.StatusInvalid
 				challenge.Error = remoteProb
 				logEvent.Error = remoteProb.Error()
+				beeline.AddFieldToTrace(ctx, "challenge.error", remoteProb.Error())
 				va.log.Infof("Validation failed due to remote failures: identifier=%v err=%s",
 					req.Domain, remoteProb)
 				va.metrics.remoteValidationFailures.Inc()
@@ -672,6 +686,8 @@ func (va *ValidationAuthorityImpl) PerformValidation(ctx context.Context, req *v
 	}
 
 	logEvent.Challenge = challenge
+	beeline.AddFieldToTrace(ctx, "challenge.type", challenge.Type)
+	beeline.AddFieldToTrace(ctx, "challenge.status", challenge.Status)
 
 	validationLatency := time.Since(vStart)
 	logEvent.ValidationLatency = validationLatency.Round(time.Millisecond).Seconds()

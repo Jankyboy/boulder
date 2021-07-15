@@ -115,6 +115,7 @@ func setChallengeToken(ch *core.Challenge, token string) {
 
 func setup(srv *httptest.Server, maxRemoteFailures int, userAgent string, remoteVAs []RemoteVA) (*ValidationAuthorityImpl, *blog.Mock) {
 	features.Reset()
+	fc := clock.NewFake()
 
 	logger := blog.NewMock()
 
@@ -133,13 +134,13 @@ func setup(srv *httptest.Server, maxRemoteFailures int, userAgent string, remote
 	va, err := NewValidationAuthorityImpl(
 		// Use the test server's port as both the HTTPPort and the TLSPort for the VA
 		&portConfig,
-		&bdns.MockDNSClient{Log: logger},
+		&bdns.MockClient{Log: logger},
 		nil,
 		maxRemoteFailures,
 		userAgent,
 		"letsencrypt.org",
 		metrics.NoopRegisterer,
-		clock.New(),
+		fc,
 		logger,
 		accountURIPrefixes,
 	)
@@ -173,6 +174,8 @@ func (s *multiSrv) setAllowedUAs(allowedUAs map[string]bool) {
 	s.allowedUAs = allowedUAs
 }
 
+const slowRemoteSleepMillis = 1000
+
 func httpMultiSrv(t *testing.T, token string, allowedUAs map[string]bool) *multiSrv {
 	m := http.NewServeMux()
 
@@ -181,7 +184,7 @@ func httpMultiSrv(t *testing.T, token string, allowedUAs map[string]bool) *multi
 
 	m.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.UserAgent() == "slow remote" {
-			time.Sleep(time.Second * 5)
+			time.Sleep(slowRemoteSleepMillis)
 		}
 		ms.mu.Lock()
 		defer ms.mu.Unlock()
@@ -206,7 +209,7 @@ func (v cancelledVA) PerformValidation(_ context.Context, _ *vapb.PerformValidat
 	return nil, context.Canceled
 }
 
-// brokenRemoteVA is a mock for the core.ValidationAuthority interface mocked to
+// brokenRemoteVA is a mock for the vapb.VAClient interface mocked to
 // always return errors.
 type brokenRemoteVA struct{}
 
@@ -245,14 +248,11 @@ func TestPerformValidationInvalid(t *testing.T) {
 	res, _ := va.PerformValidation(context.Background(), req)
 	test.Assert(t, res.Problems != nil, "validation succeeded")
 
-	samples := test.CountHistogramSamples(va.metrics.validationTime.With(prometheus.Labels{
+	test.AssertMetricWithLabelsEquals(t, va.metrics.validationTime, prometheus.Labels{
 		"type":         "dns-01",
 		"result":       "invalid",
 		"problem_type": "unauthorized",
-	}))
-	if samples != 1 {
-		t.Errorf("Wrong number of samples for invalid validation. Expected 1, got %d", samples)
-	}
+	}, 1)
 }
 
 func TestPerformValidationValid(t *testing.T) {
@@ -263,20 +263,17 @@ func TestPerformValidationValid(t *testing.T) {
 	res, _ := va.PerformValidation(context.Background(), req)
 	test.Assert(t, res.Problems == nil, fmt.Sprintf("validation failed: %#v", res.Problems))
 
-	samples := test.CountHistogramSamples(va.metrics.validationTime.With(prometheus.Labels{
+	test.AssertMetricWithLabelsEquals(t, va.metrics.validationTime, prometheus.Labels{
 		"type":         "dns-01",
 		"result":       "valid",
 		"problem_type": "",
-	}))
-	if samples != 1 {
-		t.Errorf("Wrong number of samples for successful validation. Expected 1, got %d", samples)
-	}
+	}, 1)
 	resultLog := mockLog.GetAllMatching(`Validation result`)
 	if len(resultLog) != 1 {
 		t.Fatalf("Wrong number of matching lines for 'Validation result'")
 	}
 	if !strings.Contains(resultLog[0], `"Hostname":"good-dns01.com"`) {
-		t.Errorf("PerformValidation didn't log validation hostname.")
+		t.Error("PerformValidation didn't log validation hostname.")
 	}
 }
 
@@ -291,14 +288,11 @@ func TestPerformValidationWildcard(t *testing.T) {
 	res, _ := va.PerformValidation(context.Background(), req)
 	test.Assert(t, res.Problems == nil, fmt.Sprintf("validation failed: %#v", res.Problems))
 
-	samples := test.CountHistogramSamples(va.metrics.validationTime.With(prometheus.Labels{
+	test.AssertMetricWithLabelsEquals(t, va.metrics.validationTime, prometheus.Labels{
 		"type":         "dns-01",
 		"result":       "valid",
 		"problem_type": "",
-	}))
-	if samples != 1 {
-		t.Errorf("Wrong number of samples for successful validation. Expected 1, got %d", samples)
-	}
+	}, 1)
 	resultLog := mockLog.GetAllMatching(`Validation result`)
 	if len(resultLog) != 1 {
 		t.Fatalf("Wrong number of matching lines for 'Validation result'")
@@ -595,16 +589,17 @@ func TestMultiVAEarlyReturn(t *testing.T) {
 				t.Error("expected prob from PerformValidation, got nil")
 			}
 
-			elapsed := time.Since(start).Round(time.Millisecond).Seconds()
+			elapsed := time.Since(start).Round(time.Millisecond).Milliseconds()
 
-			// The slow UA should sleep for 5 seconds. In the early return case the
-			// first remote VA should fail the overall validation and a prob should be
-			// returned quickly. In the non-early return case we don't expect
-			// a problem for 5s.
-			if tc.EarlyReturn && elapsed > 4.0 {
+			// The slow UA should sleep for `slowRemoteSleepMillis`. In the early return
+			// case the first remote VA should fail the overall validation and a prob
+			// should be returned quickly (i.e. in less than half of `slowRemoteSleepMillis`).
+			// In the non-early return case we don't expect a problem until
+			// `slowRemoteSleepMillis`.
+			if tc.EarlyReturn && elapsed > slowRemoteSleepMillis/2 {
 				t.Errorf(
-					"Expected an early return from PerformValidation in < 4.0s, took %f",
-					elapsed)
+					"Expected an early return from PerformValidation in < %d ms, took %d ms",
+					slowRemoteSleepMillis/2, elapsed)
 			}
 		})
 	}

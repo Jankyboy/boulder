@@ -40,6 +40,7 @@ import (
 	"github.com/letsencrypt/boulder/goodkey"
 	bgrpc "github.com/letsencrypt/boulder/grpc"
 	"github.com/letsencrypt/boulder/identifier"
+	"github.com/letsencrypt/boulder/issuance"
 	blog "github.com/letsencrypt/boulder/log"
 	"github.com/letsencrypt/boulder/metrics"
 	"github.com/letsencrypt/boulder/mocks"
@@ -56,6 +57,7 @@ import (
 	"github.com/weppos/publicsuffix-go/publicsuffix"
 	"golang.org/x/crypto/ocsp"
 	"google.golang.org/grpc"
+	"google.golang.org/protobuf/types/known/emptypb"
 	jose "gopkg.in/square/go-jose.v2"
 )
 
@@ -222,6 +224,7 @@ type dummyRateLimitConfig struct {
 	NewOrdersPerAccountPolicy             ratelimit.RateLimitPolicy
 	InvalidAuthorizationsPerAccountPolicy ratelimit.RateLimitPolicy
 	CertificatesPerFQDNSetPolicy          ratelimit.RateLimitPolicy
+	CertificatesPerFQDNSetFastPolicy      ratelimit.RateLimitPolicy
 }
 
 func (r *dummyRateLimitConfig) TotalCertificates() ratelimit.RateLimitPolicy {
@@ -260,8 +263,25 @@ func (r *dummyRateLimitConfig) CertificatesPerFQDNSet() ratelimit.RateLimitPolic
 	return r.CertificatesPerFQDNSetPolicy
 }
 
+func (r *dummyRateLimitConfig) CertificatesPerFQDNSetFast() ratelimit.RateLimitPolicy {
+	return r.CertificatesPerFQDNSetFastPolicy
+}
+
 func (r *dummyRateLimitConfig) LoadPolicies(contents []byte) error {
 	return nil // NOP - unrequired behaviour for this mock
+}
+
+func parseAndMarshalIP(t *testing.T, ip string) []byte {
+	ipBytes, err := net.ParseIP(ip).MarshalText()
+	test.AssertNotError(t, err, "failed to marshal ip")
+	return ipBytes
+}
+
+func newAcctKey(t *testing.T) []byte {
+	key := &jose.JSONWebKey{Key: testKey()}
+	acctKey, err := key.MarshalJSON()
+	test.AssertNotError(t, err, "failed to marshal account key")
+	return acctKey
 }
 
 func initAuthorities(t *testing.T) (*DummyValidationAuthority, *sa.SQLStorageAuthority, *RegistrationAuthorityImpl, clock.FakeClock, func()) {
@@ -282,7 +302,7 @@ func initAuthorities(t *testing.T) (*DummyValidationAuthority, *sa.SQLStorageAut
 	// Set to some non-zero time.
 	fc.Set(time.Date(2015, 3, 4, 5, 0, 0, 0, time.UTC))
 
-	dbMap, err := sa.NewDbMap(vars.DBConnSA, 0)
+	dbMap, err := sa.NewDbMap(vars.DBConnSA, sa.DbSettings{})
 	if err != nil {
 		t.Fatalf("Failed to create dbMap: %s", err)
 	}
@@ -321,7 +341,7 @@ func initAuthorities(t *testing.T) (*DummyValidationAuthority, *sa.SQLStorageAut
 		Status:    core.StatusValid,
 	})
 
-	ctp := ctpolicy.New(&mocks.Publisher{}, nil, nil, log, metrics.NoopRegisterer)
+	ctp := ctpolicy.New(&mocks.PublisherClient{}, nil, nil, log, metrics.NoopRegisterer)
 
 	ra := NewRegistrationAuthorityImpl(fc,
 		log,
@@ -425,25 +445,91 @@ func TestNewRegistration(t *testing.T) {
 	_, sa, ra, _, cleanUp := initAuthorities(t)
 	defer cleanUp()
 	mailto := "mailto:foo@letsencrypt.org"
-	input := core.Registration{
-		Contact:   &[]string{mailto},
-		Key:       &AccountKeyB,
-		InitialIP: net.ParseIP("7.6.6.5"),
+	acctKeyB, err := AccountKeyB.MarshalJSON()
+	test.AssertNotError(t, err, "failed to marshal account key")
+	input := &corepb.Registration{
+		Contact:         []string{mailto},
+		ContactsPresent: true,
+		Key:             acctKeyB,
+		InitialIP:       parseAndMarshalIP(t, "7.6.6.5"),
 	}
 
 	result, err := ra.NewRegistration(ctx, input)
 	if err != nil {
 		t.Fatalf("could not create new registration: %s", err)
 	}
-
-	test.Assert(t, core.KeyDigestEquals(result.Key, AccountKeyB), "Key didn't match")
-	test.Assert(t, len(*result.Contact) == 1, "Wrong number of contacts")
-	test.Assert(t, mailto == (*result.Contact)[0], "Contact didn't match")
+	test.AssertByteEquals(t, result.Key, acctKeyB)
+	test.Assert(t, len(result.Contact) == 1, "Wrong number of contacts")
+	test.Assert(t, mailto == (result.Contact)[0], "Contact didn't match")
 	test.Assert(t, result.Agreement == "", "Agreement didn't default empty")
 
-	reg, err := sa.GetRegistration(ctx, result.ID)
+	reg, err := sa.GetRegistration(ctx, result.Id)
 	test.AssertNotError(t, err, "Failed to retrieve registration")
 	test.Assert(t, core.KeyDigestEquals(reg.Key, AccountKeyB), "Retrieved registration differed.")
+}
+
+func TestNewRegistrationContactsPresent(t *testing.T) {
+	_, _, ra, _, cleanUp := initAuthorities(t)
+	defer cleanUp()
+	testCases := []struct {
+		Name        string
+		Reg         *corepb.Registration
+		ExpectedErr error
+	}{
+		{
+			Name: "No contacts provided by client ContactsPresent false",
+			Reg: &corepb.Registration{
+				Key:       newAcctKey(t),
+				InitialIP: parseAndMarshalIP(t, "7.6.6.5"),
+			},
+			ExpectedErr: nil,
+		},
+		{
+			Name: "Empty contact provided by client ContactsPresent true",
+			Reg: &corepb.Registration{
+				Contact:         []string{},
+				ContactsPresent: true,
+				Key:             newAcctKey(t),
+				InitialIP:       parseAndMarshalIP(t, "7.6.6.4"),
+			},
+			ExpectedErr: nil,
+		},
+		{
+			Name: "Valid contact provided by client ContactsPresent true",
+			Reg: &corepb.Registration{
+				Contact:         []string{"mailto:foo@letsencrypt.org"},
+				ContactsPresent: true,
+				Key:             newAcctKey(t),
+				InitialIP:       parseAndMarshalIP(t, "7.6.4.3"),
+			},
+			ExpectedErr: nil,
+		},
+		{
+			Name: "Valid contact provided by client ContactsPresent false",
+			Reg: &corepb.Registration{
+				Contact:         []string{"mailto:foo@letsencrypt.org"},
+				ContactsPresent: false,
+				Key:             newAcctKey(t),
+				InitialIP:       parseAndMarshalIP(t, "7.6.6.2"),
+			},
+			ExpectedErr: fmt.Errorf("account contacts present but contactsPresent false"),
+		},
+	}
+	// For each test case we check that the NewRegistration works as
+	// intended with variations of Contact and ContactsPresent fields
+	for _, tc := range testCases {
+		t.Run(tc.Name, func(t *testing.T) {
+			// Create new registration
+			_, err := ra.NewRegistration(ctx, tc.Reg)
+			// Check error output
+			if tc.ExpectedErr == nil {
+				test.AssertNotError(t, err, "expected no error for NewRegistration")
+			} else {
+				test.AssertError(t, err, "expected error for NewRegistration")
+				test.AssertEquals(t, err.Error(), tc.ExpectedErr.Error())
+			}
+		})
+	}
 }
 
 type mockSAFailsNewRegistration struct {
@@ -458,13 +544,15 @@ func TestNewRegistrationSAFailure(t *testing.T) {
 	_, _, ra, _, cleanUp := initAuthorities(t)
 	defer cleanUp()
 	ra.SA = &mockSAFailsNewRegistration{}
-	input := core.Registration{
-		Contact:   &[]string{"mailto:test@example.com"},
-		Key:       &AccountKeyB,
-		InitialIP: net.ParseIP("7.6.6.5"),
+	acctKeyB, err := AccountKeyB.MarshalJSON()
+	test.AssertNotError(t, err, "failed to marshal account key")
+	input := corepb.Registration{
+		Contact:         []string{"mailto:test@example.com"},
+		ContactsPresent: true,
+		Key:             acctKeyB,
+		InitialIP:       parseAndMarshalIP(t, "7.6.6.5"),
 	}
-
-	result, err := ra.NewRegistration(ctx, input)
+	result, err := ra.NewRegistration(ctx, &input)
 	if err == nil {
 		t.Fatalf("NewRegistration should have failed when SA.NewRegistration failed %#v", result.Key)
 	}
@@ -474,18 +562,20 @@ func TestNewRegistrationNoFieldOverwrite(t *testing.T) {
 	_, _, ra, _, cleanUp := initAuthorities(t)
 	defer cleanUp()
 	mailto := "mailto:foo@letsencrypt.org"
-	input := core.Registration{
-		ID:        23,
-		Key:       &AccountKeyC,
-		Contact:   &[]string{mailto},
-		Agreement: "I agreed",
-		InitialIP: net.ParseIP("5.0.5.0"),
+	acctKeyC, err := AccountKeyC.MarshalJSON()
+	test.AssertNotError(t, err, "failed to marshal account key")
+	input := &corepb.Registration{
+		Id:              23,
+		Key:             acctKeyC,
+		Contact:         []string{mailto},
+		ContactsPresent: true,
+		Agreement:       "I agreed",
+		InitialIP:       parseAndMarshalIP(t, "5.0.5.0"),
 	}
 
 	result, err := ra.NewRegistration(ctx, input)
 	test.AssertNotError(t, err, "Could not create new registration")
-
-	test.Assert(t, result.ID != 23, "ID shouldn't be set by user")
+	test.Assert(t, result.Id != 23, "ID shouldn't be set by user")
 	// TODO: Enable this test case once we validate terms agreement.
 	//test.Assert(t, result.Agreement != "I agreed", "Agreement shouldn't be set with invalid URL")
 }
@@ -494,12 +584,14 @@ func TestNewRegistrationBadKey(t *testing.T) {
 	_, _, ra, _, cleanUp := initAuthorities(t)
 	defer cleanUp()
 	mailto := "mailto:foo@letsencrypt.org"
-	input := core.Registration{
-		Contact: &[]string{mailto},
-		Key:     &ShortKey,
+	shortKey, err := ShortKey.MarshalJSON()
+	test.AssertNotError(t, err, "failed to marshal account key")
+	input := &corepb.Registration{
+		Contact:         []string{mailto},
+		ContactsPresent: true,
+		Key:             shortKey,
 	}
-
-	_, err := ra.NewRegistration(ctx, input)
+	_, err = ra.NewRegistration(ctx, input)
 	test.AssertError(t, err, "Should have rejected authorization with short key")
 }
 
@@ -528,18 +620,18 @@ func TestNewRegistrationRateLimit(t *testing.T) {
 
 	// Create one registration for an IPv4 address
 	mailto := "mailto:foo@letsencrypt.org"
-	reg := core.Registration{
-		Contact:   &[]string{mailto},
-		Key:       &jose.JSONWebKey{Key: testKey()},
-		InitialIP: net.ParseIP("7.6.6.5"),
+	reg := &corepb.Registration{
+		Contact:         []string{mailto},
+		ContactsPresent: true,
+		Key:             newAcctKey(t),
+		InitialIP:       parseAndMarshalIP(t, "7.6.6.5"),
 	}
-
 	// There should be no errors - it is within the RegistrationsPerIP rate limit
 	_, err := ra.NewRegistration(ctx, reg)
 	test.AssertNotError(t, err, "Unexpected error adding new IPv4 registration")
 
 	// Create another registration for the same IPv4 address by changing the key
-	reg.Key = &jose.JSONWebKey{Key: testKey()}
+	reg.Key = newAcctKey(t)
 
 	// There should be an error since a 2nd registration will exceed the
 	// RegistrationsPerIP rate limit
@@ -548,15 +640,15 @@ func TestNewRegistrationRateLimit(t *testing.T) {
 	test.AssertEquals(t, err.Error(), "too many registrations for this IP: see https://letsencrypt.org/docs/rate-limits/")
 
 	// Create a registration for an IPv6 address
-	reg.Key = &jose.JSONWebKey{Key: testKey()}
-	reg.InitialIP = net.ParseIP("2001:cdba:1234:5678:9101:1121:3257:9652")
+	reg.Key = newAcctKey(t)
+	reg.InitialIP = parseAndMarshalIP(t, "2001:cdba:1234:5678:9101:1121:3257:9652")
 
 	// There should be no errors - it is within the RegistrationsPerIP rate limit
 	_, err = ra.NewRegistration(ctx, reg)
 	test.AssertNotError(t, err, "Unexpected error adding a new IPv6 registration")
 
 	// Create a 2nd registration for the IPv6 address by changing the key
-	reg.Key = &jose.JSONWebKey{Key: testKey()}
+	reg.Key = newAcctKey(t)
 
 	// There should be an error since a 2nd reg for the same IPv6 address will
 	// exceed the RegistrationsPerIP rate limit
@@ -565,8 +657,8 @@ func TestNewRegistrationRateLimit(t *testing.T) {
 	test.AssertEquals(t, err.Error(), "too many registrations for this IP: see https://letsencrypt.org/docs/rate-limits/")
 
 	// Create a registration for an IPv6 address in the same /48
-	reg.Key = &jose.JSONWebKey{Key: testKey()}
-	reg.InitialIP = net.ParseIP("2001:cdba:1234:5678:9101:1121:3257:9653")
+	reg.Key = newAcctKey(t)
+	reg.InitialIP = parseAndMarshalIP(t, "2001:cdba:1234:5678:9101:1121:3257:9653")
 
 	// There should be no errors since two IPv6 addresses in the same /48 is
 	// within the RegistrationsPerIPRange limit
@@ -574,8 +666,8 @@ func TestNewRegistrationRateLimit(t *testing.T) {
 	test.AssertNotError(t, err, "Unexpected error adding second IPv6 registration in the same /48")
 
 	// Create a registration for yet another IPv6 address in the same /48
-	reg.Key = &jose.JSONWebKey{Key: testKey()}
-	reg.InitialIP = net.ParseIP("2001:cdba:1234:5678:9101:1121:3257:9654")
+	reg.Key = newAcctKey(t)
+	reg.InitialIP = parseAndMarshalIP(t, "2001:cdba:1234:5678:9101:1121:3257:9654")
 
 	// There should be an error since three registrations within the same IPv6
 	// /48 is outside of the RegistrationsPerIPRange limit
@@ -598,31 +690,33 @@ func TestUpdateRegistrationSame(t *testing.T) {
 	mailto := "mailto:foo@letsencrypt.org"
 
 	// Make a new registration with AccountKeyC and a Contact
-	input := core.Registration{
-		Key:       &AccountKeyC,
-		Contact:   &[]string{mailto},
-		Agreement: "I agreed",
-		InitialIP: net.ParseIP("5.0.5.0"),
+	acctKeyC, err := AccountKeyC.MarshalJSON()
+	test.AssertNotError(t, err, "failed to marshal account key")
+	reg := &corepb.Registration{
+		Key:             acctKeyC,
+		Contact:         []string{mailto},
+		ContactsPresent: true,
+		Agreement:       "I agreed",
+		InitialIP:       parseAndMarshalIP(t, "5.0.5.0"),
 	}
-	createResult, err := ra.NewRegistration(ctx, input)
+	result, err := ra.NewRegistration(ctx, reg)
 	test.AssertNotError(t, err, "Could not create new registration")
-	id := createResult.ID
 
 	// Switch to a mock SA that will always error if UpdateRegistration() is called
 	ra.SA = &NoUpdateSA{}
 
 	// Make an update to the registration with the same Contact & Agreement values.
-	updateSame := core.Registration{
-		ID:        id,
-		Key:       &AccountKeyC,
-		Contact:   &[]string{mailto},
+	updateSame := &corepb.Registration{
+		Id:        result.Id,
+		Key:       acctKeyC,
+		Contact:   []string{mailto},
 		Agreement: "I agreed",
 	}
 
 	// The update operation should *not* error, even with the NoUpdateSA because
 	// UpdateRegistration() should not be called when the update content doesn't
 	// actually differ from the existing content
-	_, err = ra.UpdateRegistration(ctx, input, updateSame)
+	_, err = ra.UpdateRegistration(ctx, &rapb.UpdateRegistrationRequest{Base: result, Update: updateSame})
 	test.AssertNotError(t, err, "Error updating registration")
 }
 
@@ -856,9 +950,7 @@ func TestNewAuthorizationInvalidName(t *testing.T) {
 	if err == nil {
 		t.Fatalf("NewAuthorization succeeded for 127.0.0.1, should have failed")
 	}
-	if !berrors.Is(err, berrors.Malformed) {
-		t.Errorf("expected berrors.BoulderError with internal type berrors.Malformed, got %T", err)
-	}
+	test.AssertErrorIs(t, err, berrors.Malformed)
 }
 
 func TestPerformValidationExpired(t *testing.T) {
@@ -889,6 +981,7 @@ func TestPerformValidationAlreadyValid(t *testing.T) {
 	// Create a finalized authorization
 	exp := ra.clk.Now().Add(365 * 24 * time.Hour)
 	authz := core.Authorization{
+		ID:             "1337",
 		Identifier:     identifier.DNSIdentifier("not-example.com"),
 		RegistrationID: 1,
 		Status:         "valid",
@@ -921,12 +1014,11 @@ func TestPerformValidationAlreadyValid(t *testing.T) {
 		Authz:          authzPB,
 		ChallengeIndex: int64(ResponseIndex),
 	})
-	test.Assert(t, berrors.Is(err, berrors.WrongAuthorizationState),
-		"PerformValidation of valid authz (with reuseValidAuthz disabled) didn't return a berrors.WrongAuthorizationState")
+	test.AssertErrorIs(t, err, berrors.Malformed)
 }
 
 func TestPerformValidationSuccess(t *testing.T) {
-	va, sa, ra, _, cleanUp := initAuthorities(t)
+	va, sa, ra, fc, cleanUp := initAuthorities(t)
 	defer cleanUp()
 
 	// We know this is OK because of TestNewAuthorization
@@ -984,12 +1076,16 @@ func TestPerformValidationSuccess(t *testing.T) {
 
 	// The DB authz's expiry should be equal to the current time plus the
 	// configured authorization lifetime
-	expectedExpires := ra.clk.Now().Add(ra.authorizationLifetime)
+	expectedExpires := fc.Now().Add(ra.authorizationLifetime)
 	test.AssertEquals(t, *dbAuthz.Expires, expectedExpires)
+
+	// Check that validated timestamp was recorded, stored, and retrieved
+	expectedValidated := fc.Now()
+	test.Assert(t, *dbAuthz.Challenges[challIdx].Validated == expectedValidated, "Validated timestamp incorrect or missing")
 }
 
 func TestPerformValidationVAError(t *testing.T) {
-	va, sa, ra, _, cleanUp := initAuthorities(t)
+	va, sa, ra, fc, cleanUp := initAuthorities(t)
 	defer cleanUp()
 
 	authz, err := ra.NewAuthorization(ctx, AuthzRequest, Registration.ID)
@@ -1034,6 +1130,10 @@ func TestPerformValidationVAError(t *testing.T) {
 	test.Assert(t, dbAuthz.Challenges[challIdx].Status == core.StatusInvalid, "challenge was not marked as invalid")
 	test.AssertContains(t, dbAuthz.Challenges[challIdx].Error.Error(), "Could not communicate with VA")
 	test.Assert(t, dbAuthz.Challenges[challIdx].ValidationRecord == nil, "challenge had a ValidationRecord")
+
+	// Check that validated timestamp was recorded, stored, and retrieved
+	expectedValidated := fc.Now()
+	test.Assert(t, *dbAuthz.Challenges[challIdx].Validated == expectedValidated, "Validated timestamp incorrect or missing")
 }
 
 func TestCertificateKeyNotEqualAccountKey(t *testing.T) {
@@ -1055,7 +1155,7 @@ func TestCertificateKeyNotEqualAccountKey(t *testing.T) {
 	}
 
 	// Registration has key == AccountKeyA
-	_, err = ra.NewCertificate(ctx, certRequest, Registration.ID)
+	_, err = ra.NewCertificate(ctx, certRequest, Registration.ID, 1)
 	test.AssertError(t, err, "Should have rejected cert with key = account key")
 	test.AssertEquals(t, err.Error(), "certificate public key must be different than account key")
 }
@@ -1072,7 +1172,7 @@ func TestAuthorizationRequired(t *testing.T) {
 		CSR: ExampleCSR,
 	}
 
-	_, err := ra.NewCertificate(ctx, certRequest, 1)
+	_, err := ra.NewCertificate(ctx, certRequest, 1, 1)
 	test.Assert(t, err != nil, "Issued certificate with insufficient authorization")
 }
 
@@ -1090,7 +1190,7 @@ func TestNewCertificate(t *testing.T) {
 		CSR: ExampleCSR,
 	}
 
-	_, err := ra.NewCertificate(ctx, certRequest, Registration.ID)
+	_, err := ra.NewCertificate(ctx, certRequest, Registration.ID, 1)
 	ExampleCSR.Signature[0]--
 	test.AssertError(t, err, "Failed to check CSR signature")
 
@@ -1100,7 +1200,7 @@ func TestNewCertificate(t *testing.T) {
 		CSR: ExampleCSR,
 	}
 
-	cert, err := ra.NewCertificate(ctx, certRequest, Registration.ID)
+	cert, err := ra.NewCertificate(ctx, certRequest, Registration.ID, 1)
 	test.AssertNotError(t, err, "Failed to issue certificate")
 
 	_, err = x509.ParseCertificate(cert.DER)
@@ -1330,8 +1430,10 @@ func TestRateLimitLiveReload(t *testing.T) {
 	test.AssertEquals(t, ra.rlPolicies.CertificatesPerName().Overrides["le.wtf"], 10000)
 	test.AssertEquals(t, ra.rlPolicies.RegistrationsPerIP().Overrides["127.0.0.1"], 1000000)
 	test.AssertEquals(t, ra.rlPolicies.PendingAuthorizationsPerAccount().Threshold, 150)
+	test.AssertEquals(t, ra.rlPolicies.CertificatesPerFQDNSet().Threshold, 6)
 	test.AssertEquals(t, ra.rlPolicies.CertificatesPerFQDNSet().Overrides["le.wtf"], 10000)
-	test.AssertEquals(t, ra.rlPolicies.CertificatesPerFQDNSet().Threshold, 5)
+	test.AssertEquals(t, ra.rlPolicies.CertificatesPerFQDNSetFast().Threshold, 2)
+	test.AssertEquals(t, ra.rlPolicies.CertificatesPerFQDNSetFast().Overrides["le.wtf"], 100)
 
 	// Write a different  policy YAML to the monitored file, expect a reload.
 	// Sleep a few milliseconds before writing so the timestamp isn't identical to
@@ -1419,12 +1521,12 @@ func TestCheckCertificatesPerNameLimit(t *testing.T) {
 	mockSA.nameCounts["good-example.com"] = nameCount("good-example.com", 1)
 	err = ra.checkCertificatesPerNameLimit(ctx, []string{"www.example.com", "example.com", "good-example.com"}, rlp, 99)
 	test.AssertError(t, err, "incorrectly failed to rate limit example.com")
-	if !berrors.Is(err, berrors.RateLimit) {
-		t.Errorf("Incorrect error type %#v", err)
-	}
+	test.AssertErrorIs(t, err, berrors.RateLimit)
 	// Verify it has no sub errors as there is only one bad name
 	test.AssertEquals(t, err.Error(), "too many certificates already issued for: example.com: see https://letsencrypt.org/docs/rate-limits/")
-	test.AssertEquals(t, len(err.(*berrors.BoulderError).SubErrors), 0)
+	var bErr *berrors.BoulderError
+	test.AssertErrorWraps(t, err, &bErr)
+	test.AssertEquals(t, len(bErr.SubErrors), 0)
 
 	// Three base domains, two above threshold, one below
 	mockSA.nameCounts["example.com"] = nameCount("example.com", 10)
@@ -1432,12 +1534,11 @@ func TestCheckCertificatesPerNameLimit(t *testing.T) {
 	mockSA.nameCounts["good-example.com"] = nameCount("good-example.com", 1)
 	err = ra.checkCertificatesPerNameLimit(ctx, []string{"example.com", "other-example.com", "good-example.com"}, rlp, 99)
 	test.AssertError(t, err, "incorrectly failed to rate limit example.com, other-example.com")
-	if !berrors.Is(err, berrors.RateLimit) {
-		t.Errorf("Incorrect error type %#v", err)
-	}
+	test.AssertErrorIs(t, err, berrors.RateLimit)
 	// Verify it has two sub errors as there are two bad names
 	test.AssertEquals(t, err.Error(), "too many certificates already issued for multiple names (example.com and 2 others): see https://letsencrypt.org/docs/rate-limits/")
-	test.AssertEquals(t, len(err.(*berrors.BoulderError).SubErrors), 2)
+	test.AssertErrorWraps(t, err, &bErr)
+	test.AssertEquals(t, len(bErr.SubErrors), 2)
 
 	// SA misbehaved and didn't send back a count for every input name
 	err = ra.checkCertificatesPerNameLimit(ctx, []string{"zombo.com", "www.example.com", "example.com"}, rlp, 99)
@@ -1454,17 +1555,13 @@ func TestCheckCertificatesPerNameLimit(t *testing.T) {
 	mockSA.nameCounts["bigissuer.com"] = nameCount("bigissuer.com", 100)
 	err = ra.checkCertificatesPerNameLimit(ctx, []string{"www.example.com", "subdomain.bigissuer.com"}, rlp, 99)
 	test.AssertError(t, err, "incorrectly failed to rate limit bigissuer")
-	if !berrors.Is(err, berrors.RateLimit) {
-		t.Errorf("Incorrect error type")
-	}
+	test.AssertErrorIs(t, err, berrors.RateLimit)
 
 	// One base domain, above its override (which is below threshold)
 	mockSA.nameCounts["smallissuer.co.uk"] = nameCount("smallissuer.co.uk", 1)
 	err = ra.checkCertificatesPerNameLimit(ctx, []string{"www.smallissuer.co.uk"}, rlp, 99)
 	test.AssertError(t, err, "incorrectly failed to rate limit smallissuer")
-	if !berrors.Is(err, berrors.RateLimit) {
-		t.Errorf("Incorrect error type %#v", err)
-	}
+	test.AssertErrorIs(t, err, berrors.RateLimit)
 }
 
 // TestCheckExactCertificateLimit tests that the duplicate certificate limit
@@ -1505,12 +1602,12 @@ func TestCheckExactCertificateLimit(t *testing.T) {
 		{
 			Name:        "FQDN set issuances equal to limit",
 			Domain:      "equal.example.com",
-			ExpectedErr: fmt.Errorf("too many certificates already issued for exact set of domains: equal.example.com: see https://letsencrypt.org/docs/rate-limits/"),
+			ExpectedErr: fmt.Errorf("too many certificates (3) already issued for this exact set of domains in the last 23 hours: equal.example.com: see https://letsencrypt.org/docs/rate-limits/"),
 		},
 		{
 			Name:        "FQDN set issuances above limit",
 			Domain:      "over.example.com",
-			ExpectedErr: fmt.Errorf("too many certificates already issued for exact set of domains: over.example.com: see https://letsencrypt.org/docs/rate-limits/"),
+			ExpectedErr: fmt.Errorf("too many certificates (3) already issued for this exact set of domains in the last 23 hours: over.example.com: see https://letsencrypt.org/docs/rate-limits/"),
 		},
 	}
 
@@ -1803,12 +1900,21 @@ func TestDeactivateRegistration(t *testing.T) {
 	_, _, ra, _, cleanUp := initAuthorities(t)
 	defer cleanUp()
 
-	err := ra.DeactivateRegistration(context.Background(), core.Registration{ID: 1})
+	// Deactivate failure because incomplete registration provided
+	_, err := ra.DeactivateRegistration(context.Background(), &corepb.Registration{})
+	test.AssertDeepEquals(t, err, fmt.Errorf("incomplete gRPC request message"))
+
+	// Deactivate failure because registration status already deactivated
+	_, err = ra.DeactivateRegistration(context.Background(),
+		&corepb.Registration{Id: 1, Status: string(core.StatusDeactivated)})
 	test.AssertError(t, err, "DeactivateRegistration failed with a non-valid registration")
-	err = ra.DeactivateRegistration(context.Background(), core.Registration{ID: 1, Status: core.StatusDeactivated})
-	test.AssertError(t, err, "DeactivateRegistration failed with a non-valid registration")
-	err = ra.DeactivateRegistration(context.Background(), core.Registration{ID: 1, Status: core.StatusValid})
+
+	// Deactivate success with valid registration
+	_, err = ra.DeactivateRegistration(context.Background(),
+		&corepb.Registration{Id: 1, Status: string(core.StatusValid)})
 	test.AssertNotError(t, err, "DeactivateRegistration failed")
+
+	// Check db to make sure account is deactivated
 	dbReg, err := ra.SA.GetRegistration(context.Background(), 1)
 	test.AssertNotError(t, err, "GetRegistration failed")
 	test.AssertEquals(t, dbReg.Status, core.StatusDeactivated)
@@ -2013,17 +2119,10 @@ func TestRecheckCAAFail(t *testing.T) {
 	}
 	err := ra.recheckCAA(context.Background(), authzs)
 
-	if err == nil {
-		t.Fatalf("expected err, got nil")
-	} else if !berrors.Is(err, berrors.CAA) {
-		t.Fatalf("expected CAA error, got %T", err)
-	}
-
-	// NOTE(@cpu): Safe to skip the cast check here because we already checked err
-	// with `berrors.Is(err, berrors.CAA)`
-	berr, _ := err.(*berrors.BoulderError)
-
-	// There should be two sub errors
+	test.AssertError(t, err, "expected err, got nil")
+	var berr *berrors.BoulderError
+	test.AssertErrorWraps(t, err, &berr)
+	test.AssertErrorIs(t, berr, berrors.CAA)
 	test.AssertEquals(t, len(berr.SubErrors), 2)
 
 	// We don't know whether the asynchronous a.com or c.com CAA recheck will fail
@@ -2055,8 +2154,7 @@ func TestRecheckCAAFail(t *testing.T) {
 	// It should error
 	test.AssertError(t, err, "expected err from recheckCAA")
 	// It should be a berror
-	berr, ok := err.(*berrors.BoulderError)
-	test.AssertEquals(t, ok, true)
+	test.AssertErrorWraps(t, err, &berr)
 	// There should be *no* suberrors because there was only one overall error
 	test.AssertEquals(t, len(berr.SubErrors), 0)
 }
@@ -2070,11 +2168,9 @@ func TestRecheckCAAInternalServerError(t *testing.T) {
 		makeHTTP01Authorization("b.com"),
 		makeHTTP01Authorization("d.com"),
 	}
-	if err := ra.recheckCAA(context.Background(), authzs); err == nil {
-		t.Errorf("expected err, got nil")
-	} else if !berrors.Is(err, berrors.InternalServer) {
-		t.Errorf("expected InternalServer error, got %T", err)
-	}
+	err := ra.recheckCAA(context.Background(), authzs)
+	test.AssertError(t, err, "expected err, got nil")
+	test.AssertErrorIs(t, err, berrors.InternalServer)
 }
 
 func TestNewOrder(t *testing.T) {
@@ -2205,13 +2301,14 @@ func TestNewOrderReuse(t *testing.T) {
 	}
 
 	// Create a second registration to reference
-	secondReg := core.Registration{
-		Key:       &AccountKeyB,
-		InitialIP: net.ParseIP("42.42.42.42"),
+	acctKeyB, err := AccountKeyB.MarshalJSON()
+	test.AssertNotError(t, err, "failed to marshal account key")
+	input := &corepb.Registration{
+		Key:       acctKeyB,
+		InitialIP: parseAndMarshalIP(t, "42.42.42.42"),
 	}
-	secondReg, err := ra.NewRegistration(ctx, secondReg)
+	secondReg, err := ra.NewRegistration(ctx, input)
 	test.AssertNotError(t, err, "Error creating a second test registration")
-
 	// First, add an order with `names` for regA
 	firstOrder, err := ra.NewOrder(context.Background(), orderReq)
 	// It shouldn't fail
@@ -2243,7 +2340,7 @@ func TestNewOrderReuse(t *testing.T) {
 		{
 			Name: "Duplicate order, different regID",
 			OrderReq: &rapb.NewOrderRequest{
-				RegistrationID: secondReg.ID,
+				RegistrationID: secondReg.Id,
 				Names:          names,
 			},
 			// We do not expect reuse because the order regID differs from firstOrder
@@ -3415,10 +3512,7 @@ func TestUpdateMissingAuthorization(t *testing.T) {
 
 	err = ra.recordValidation(ctx, authz.ID, authz.Expires, &authz.Challenges[0])
 	test.AssertError(t, err, "ra.recordValidation didn't fail")
-	// It should *not* be an internal server error
-	test.AssertEquals(t, berrors.Is(err, berrors.InternalServer), false)
-	// It *should* be a NotFound error
-	test.AssertEquals(t, berrors.Is(err, berrors.NotFound), true)
+	test.AssertErrorIs(t, err, berrors.NotFound)
 }
 
 func TestValidChallengeStillGood(t *testing.T) {
@@ -3444,6 +3538,10 @@ func TestPerformValidationBadChallengeType(t *testing.T) {
 
 	exp := fc.Now().Add(10 * time.Hour)
 	authz := core.Authorization{
+		ID:             "1337",
+		Identifier:     identifier.DNSIdentifier("not-example.com"),
+		RegistrationID: 1,
+		Status:         "valid",
 		Challenges: []core.Challenge{
 			{
 				Status: core.StatusValid,
@@ -3467,7 +3565,7 @@ func TestPerformValidationBadChallengeType(t *testing.T) {
 type timeoutPub struct {
 }
 
-func (mp *timeoutPub) SubmitToSingleCTWithResult(_ context.Context, _ *pubpb.Request) (*pubpb.Result, error) {
+func (mp *timeoutPub) SubmitToSingleCTWithResult(_ context.Context, _ *pubpb.Request, _ ...grpc.CallOption) (*pubpb.Result, error) {
 	return nil, context.DeadlineExceeded
 }
 
@@ -3498,9 +3596,9 @@ func TestCTPolicyMeasurements(t *testing.T) {
 
 	_, err := ra.issueCertificate(ctx, core.CertificateRequest{
 		CSR: ExampleCSR,
-	}, accountID(Registration.ID), 0)
+	}, accountID(Registration.ID), 0, 0)
 	test.AssertError(t, err, "ra.issueCertificate didn't fail when CTPolicy.GetSCTs timed out")
-	test.AssertEquals(t, test.CountHistogramSamples(ra.ctpolicyResults.With(prometheus.Labels{"result": "failure"})), 1)
+	test.AssertMetricWithLabelsEquals(t, ra.ctpolicyResults, prometheus.Labels{"result": "failure"}, 1)
 }
 
 func TestWildcardOverlap(t *testing.T) {
@@ -3519,13 +3617,8 @@ func TestWildcardOverlap(t *testing.T) {
 	if err == nil {
 		t.Errorf("Got no error, expected one")
 	}
-	berr, ok := err.(*berrors.BoulderError)
-	if !ok {
-		t.Errorf("Error was wrong type: %T", err)
-	}
-	if berr.Type != berrors.Malformed {
-		t.Errorf("Error was wrong BoulderError type: %d", berr.Type)
-	}
+	test.AssertErrorIs(t, err, berrors.Malformed)
+
 	err = wildcardOverlap([]string{
 		"*.foo.example.com",
 		"*.example.net",
@@ -3543,8 +3636,9 @@ type mockCAFailPrecert struct {
 }
 
 func (ca *mockCAFailPrecert) IssuePrecertificate(
-	_ context.Context,
-	_ *capb.IssueCertificateRequest) (*capb.IssuePrecertificateResponse, error) {
+	context.Context,
+	*capb.IssueCertificateRequest,
+	...grpc.CallOption) (*capb.IssuePrecertificateResponse, error) {
 	return nil, ca.err
 }
 
@@ -3556,7 +3650,10 @@ type mockCAFailCertForPrecert struct {
 }
 
 // IssuePrecertificate needs to be mocked for mockCAFailCertForPrecert's `IssueCertificateForPrecertificate` to get called.
-func (ca *mockCAFailCertForPrecert) IssuePrecertificate(_ context.Context, _ *capb.IssueCertificateRequest) (*capb.IssuePrecertificateResponse, error) {
+func (ca *mockCAFailCertForPrecert) IssuePrecertificate(
+	context.Context,
+	*capb.IssueCertificateRequest,
+	...grpc.CallOption) (*capb.IssuePrecertificateResponse, error) {
 	k, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		return nil, err
@@ -3581,8 +3678,9 @@ func (ca *mockCAFailCertForPrecert) IssuePrecertificate(_ context.Context, _ *ca
 }
 
 func (ca *mockCAFailCertForPrecert) IssueCertificateForPrecertificate(
-	_ context.Context,
-	_ *capb.IssueCertificateForPrecertificateRequest) (*corepb.Certificate, error) {
+	context.Context,
+	*capb.IssueCertificateForPrecertificateRequest,
+	...grpc.CallOption) (*corepb.Certificate, error) {
 	return &corepb.Certificate{}, ca.err
 }
 
@@ -3669,7 +3767,7 @@ func TestIssueCertificateInnerErrs(t *testing.T) {
 
 	testCases := []struct {
 		Name         string
-		Mock         core.CertificateAuthority
+		Mock         capb.CertificateAuthorityClient
 		ExpectedErr  error
 		ExpectedProb *berrors.BoulderError
 	}{
@@ -3714,7 +3812,7 @@ func TestIssueCertificateInnerErrs(t *testing.T) {
 			// Mock the CA
 			ra.CA = tc.Mock
 			// Attempt issuance
-			_, err = ra.issueCertificateInner(ctx, req, accountID(Registration.ID), orderID(order.Id), logEvent)
+			_, err = ra.issueCertificateInner(ctx, req, accountID(Registration.ID), orderID(order.Id), issuance.IssuerNameID(0), logEvent)
 			// We expect all of the testcases to fail because all use mocked CAs that deliberately error
 			test.AssertError(t, err, "issueCertificateInner with failing mock CA did not fail")
 			// If there is an expected `error` then match the error message
@@ -3723,12 +3821,10 @@ func TestIssueCertificateInnerErrs(t *testing.T) {
 			} else if tc.ExpectedProb != nil {
 				// If there is an expected `berrors.BoulderError` then we expect the
 				// `issueCertificateInner` error to be a `berrors.BoulderError`
-				berr, ok := err.(*berrors.BoulderError)
-				if !ok {
-					t.Fatalf("Expected a boulder error, got %#v\n", err)
-				}
+				var berr *berrors.BoulderError
+				test.AssertErrorWraps(t, err, &berr)
 				// Match the expected berror Type and Detail to the observed
-				test.AssertEquals(t, berr.Type, tc.ExpectedProb.Type)
+				test.AssertErrorIs(t, berr, tc.ExpectedProb.Type)
 				test.AssertEquals(t, berr.Detail, tc.ExpectedProb.Detail)
 			}
 		})
@@ -3791,6 +3887,7 @@ func TestNewOrderMaxNames(t *testing.T) {
 
 	ra.maxNames = 2
 	_, err := ra.NewOrder(context.Background(), &rapb.NewOrderRequest{
+		RegistrationID: 1,
 		Names: []string{
 			"a",
 			"b",
@@ -3799,7 +3896,7 @@ func TestNewOrderMaxNames(t *testing.T) {
 	})
 	test.AssertError(t, err, "NewOrder didn't fail with too many names in request")
 	test.AssertEquals(t, err.Error(), "Order cannot contain more than 2 DNS names")
-	test.AssertEquals(t, berrors.Is(err, berrors.Malformed), true)
+	test.AssertErrorIs(t, err, berrors.Malformed)
 }
 
 // CSR generated by Go:
@@ -3862,23 +3959,23 @@ type mockSABlockedKey struct {
 	added *sapb.AddBlockedKeyRequest
 }
 
-func (msabk *mockSABlockedKey) AddBlockedKey(_ context.Context, req *sapb.AddBlockedKeyRequest) (*corepb.Empty, error) {
+func (msabk *mockSABlockedKey) AddBlockedKey(_ context.Context, req *sapb.AddBlockedKeyRequest) (*emptypb.Empty, error) {
 	msabk.added = req
-	return &corepb.Empty{}, nil
+	return &emptypb.Empty{}, nil
 }
 
 type mockCAOCSP struct {
 	mocks.MockCA
 }
 
-func (mcao *mockCAOCSP) GenerateOCSP(context.Context, *capb.GenerateOCSPRequest) (*capb.OCSPResponse, error) {
+func (mcao *mockCAOCSP) GenerateOCSP(context.Context, *capb.GenerateOCSPRequest, ...grpc.CallOption) (*capb.OCSPResponse, error) {
 	return &capb.OCSPResponse{Response: []byte{1, 2, 3}}, nil
 }
 
 type mockPurger struct{}
 
-func (mp *mockPurger) Purge(context.Context, *akamaipb.PurgeRequest, ...grpc.CallOption) (*corepb.Empty, error) {
-	return &corepb.Empty{}, nil
+func (mp *mockPurger) Purge(context.Context, *akamaipb.PurgeRequest, ...grpc.CallOption) (*emptypb.Empty, error) {
+	return &emptypb.Empty{}, nil
 }
 
 func TestRevocationAddBlockedKey(t *testing.T) {
@@ -3895,27 +3992,38 @@ func TestRevocationAddBlockedKey(t *testing.T) {
 	digest, err := core.KeyDigest(k.Public())
 	test.AssertNotError(t, err, "core.KeyDigest failed")
 
-	template := x509.Certificate{PublicKey: k, SerialNumber: big.NewInt(257)}
+	template := x509.Certificate{SerialNumber: big.NewInt(257)}
 	der, err := x509.CreateCertificate(rand.Reader, &template, &template, k.Public(), k)
 	test.AssertNotError(t, err, "x509.CreateCertificate failed")
 	cert, err := x509.ParseCertificate(der)
 	test.AssertNotError(t, err, "x509.ParseCertificate failed")
-	ra.issuer = cert
+	ic := issuance.Certificate{Certificate: cert}
+	ra.issuers = map[issuance.IssuerNameID]*issuance.Certificate{
+		ic.NameID(): &ic,
+	}
 
-	err = ra.RevokeCertificateWithReg(context.Background(), *cert, ocsp.Unspecified, 0)
+	_, err = ra.RevokeCertificateWithReg(context.Background(), &rapb.RevokeCertificateWithRegRequest{
+		Cert:  cert.Raw,
+		Code:  ocsp.Unspecified,
+		RegID: 0,
+	})
 	test.AssertNotError(t, err, "RevokeCertificateWithReg failed")
 	test.Assert(t, mockSA.added == nil, "blocked key was added when reason was not keyCompromise")
-	test.AssertEquals(t, test.CountCounterVec(
-		"reason", "unspecified", ra.revocationReasonCounter), 1)
+	test.AssertMetricWithLabelsEquals(
+		t, ra.revocationReasonCounter, prometheus.Labels{"reason": "unspecified"}, 1)
 
-	err = ra.RevokeCertificateWithReg(context.Background(), *cert, ocsp.KeyCompromise, 0)
+	_, err = ra.RevokeCertificateWithReg(context.Background(), &rapb.RevokeCertificateWithRegRequest{
+		Cert:  cert.Raw,
+		Code:  ocsp.KeyCompromise,
+		RegID: 0,
+	})
 	test.AssertNotError(t, err, "RevokeCertificateWithReg failed")
 	test.Assert(t, mockSA.added != nil, "blocked key was not added when reason was keyCompromise")
 	test.Assert(t, bytes.Equal(digest[:], mockSA.added.KeyHash), "key hash mismatch")
 	test.AssertEquals(t, mockSA.added.Source, "API")
 	test.Assert(t, mockSA.added.Comment == "", "Comment is not empty")
-	test.AssertEquals(t, test.CountCounterVec(
-		"reason", "keyCompromise", ra.revocationReasonCounter), 1)
+	test.AssertMetricWithLabelsEquals(
+		t, ra.revocationReasonCounter, prometheus.Labels{"reason": "keyCompromise"}, 1)
 
 	mockSA.added = nil
 	err = ra.AdministrativelyRevokeCertificate(context.Background(), *cert, ocsp.KeyCompromise, "root")
@@ -3925,6 +4033,6 @@ func TestRevocationAddBlockedKey(t *testing.T) {
 	test.AssertEquals(t, mockSA.added.Source, "admin-revoker")
 	test.Assert(t, mockSA.added.Comment != "", "Comment is nil")
 	test.AssertEquals(t, mockSA.added.Comment, "revoked by root")
-	test.AssertEquals(t, test.CountCounterVec(
-		"reason", "keyCompromise", ra.revocationReasonCounter), 2)
+	test.AssertMetricWithLabelsEquals(
+		t, ra.revocationReasonCounter, prometheus.Labels{"reason": "keyCompromise"}, 2)
 }

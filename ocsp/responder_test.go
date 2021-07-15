@@ -97,6 +97,12 @@ func TestOCSP(t *testing.T) {
 			},
 			[]string{"type"},
 		),
+		responseAges: prometheus.NewHistogram(
+			prometheus.HistogramOpts{
+				Name:    "ocspAges-test",
+				Buckets: []float64{43200},
+			},
+		),
 		clk: clock.NewFake(),
 		log: blog.NewMock(),
 	}
@@ -116,12 +122,16 @@ func TestOCSP(t *testing.T) {
 				t.Errorf("Incorrect response code: got %d, wanted %d", rw.Code, tc.expected)
 			}
 			if rw.Code == http.StatusOK {
-				test.AssertEquals(t, 1, test.CountCounterVec("type", "Success", responder.responseTypes))
+				test.AssertMetricWithLabelsEquals(
+					t, responder.responseTypes, prometheus.Labels{"type": "Success"}, 1)
 			} else if rw.Code == http.StatusBadRequest {
-				test.AssertEquals(t, 1, test.CountCounterVec("type", "Malformed", responder.responseTypes))
+				test.AssertMetricWithLabelsEquals(
+					t, responder.responseTypes, prometheus.Labels{"type": "Malformed"}, 1)
 			}
 		})
 	}
+	// Exactly two of the cases above result in an OCSP response being sent.
+	test.AssertMetricWithLabelsEquals(t, responder.responseAges, prometheus.Labels{}, 2)
 }
 
 func TestRequestTooBig(t *testing.T) {
@@ -132,6 +142,12 @@ func TestRequestTooBig(t *testing.T) {
 				Name: "ocspResponses-test",
 			},
 			[]string{"type"},
+		),
+		responseAges: prometheus.NewHistogram(
+			prometheus.HistogramOpts{
+				Name:    "ocspAges-test",
+				Buckets: []float64{43200},
+			},
 		),
 		clk: clock.NewFake(),
 		log: blog.NewMock(),
@@ -175,6 +191,12 @@ func TestOverrideHeaders(t *testing.T) {
 			},
 			[]string{"type"},
 		),
+		responseAges: prometheus.NewHistogram(
+			prometheus.HistogramOpts{
+				Name:    "ocspAges-test",
+				Buckets: []float64{43200},
+			},
+		),
 		clk: clock.NewFake(),
 		log: blog.NewMock(),
 	}
@@ -205,6 +227,12 @@ func TestCacheHeaders(t *testing.T) {
 				Name: "ocspResponses-test",
 			},
 			[]string{"type"},
+		),
+		responseAges: prometheus.NewHistogram(
+			prometheus.HistogramOpts{
+				Name:    "ocspAges-test",
+				Buckets: []float64{43200},
+			},
 		),
 		clk: fc,
 		log: blog.NewMock(),

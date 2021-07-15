@@ -4,6 +4,10 @@ import (
 	"flag"
 	"os"
 
+	"google.golang.org/grpc/health"
+	healthpb "google.golang.org/grpc/health/grpc_health_v1"
+
+	"github.com/honeycombio/beeline-go"
 	"github.com/letsencrypt/boulder/cmd"
 	"github.com/letsencrypt/boulder/features"
 	bgrpc "github.com/letsencrypt/boulder/grpc"
@@ -14,7 +18,7 @@ import (
 type config struct {
 	SA struct {
 		cmd.ServiceConfig
-		cmd.DBConfig
+		DB cmd.DBConfig
 
 		Features map[string]bool
 
@@ -22,7 +26,8 @@ type config struct {
 		ParallelismPerRPC int
 	}
 
-	Syslog cmd.SyslogConfig
+	Syslog  cmd.SyslogConfig
+	Beeline cmd.BeelineConfig
 }
 
 func main() {
@@ -49,20 +54,31 @@ func main() {
 		c.SA.DebugAddr = *debugAddr
 	}
 
+	bc, err := c.Beeline.Load()
+	cmd.FailOnError(err, "Failed to load Beeline config")
+	beeline.Init(bc)
+	defer beeline.Close()
+
 	scope, logger := cmd.StatsAndLogging(c.Syslog, c.SA.DebugAddr)
 	defer logger.AuditPanic()
 	logger.Info(cmd.VersionString())
 
 	saConf := c.SA
+	saDbSettings := sa.DbSettings{
+		MaxOpenConns:    saConf.DB.MaxOpenConns,
+		MaxIdleConns:    saConf.DB.MaxIdleConns,
+		ConnMaxLifetime: saConf.DB.ConnMaxLifetime.Duration,
+		ConnMaxIdleTime: saConf.DB.ConnMaxIdleTime.Duration,
+	}
 
-	dbURL, err := saConf.DBConfig.URL()
+	dbURL, err := saConf.DB.URL()
 	cmd.FailOnError(err, "Couldn't load DB URL")
 
-	dbMap, err := sa.NewDbMap(dbURL, saConf.DBConfig.MaxDBConns)
+	dbMap, err := sa.NewDbMap(dbURL, saDbSettings)
 	cmd.FailOnError(err, "Couldn't connect to SA database")
 
 	// Collect and periodically report DB metrics using the DBMap and prometheus scope.
-	sa.InitDBMetrics(dbMap, scope)
+	sa.InitDBMetrics(dbMap, scope, saDbSettings)
 
 	clk := cmd.Clock()
 
@@ -76,12 +92,17 @@ func main() {
 	tls, err := c.SA.TLS.Load()
 	cmd.FailOnError(err, "TLS config")
 	serverMetrics := bgrpc.NewServerMetrics(scope)
-	grpcSrv, listener, err := bgrpc.NewServer(c.SA.GRPC, tls, serverMetrics, clk)
+	grpcSrv, listener, err := bgrpc.NewServer(c.SA.GRPC, tls, serverMetrics, clk, bgrpc.NoCancelInterceptor)
 	cmd.FailOnError(err, "Unable to setup SA gRPC server")
 	gw := bgrpc.NewStorageAuthorityServer(sai)
 	sapb.RegisterStorageAuthorityServer(grpcSrv, gw)
+	hs := health.NewServer()
+	healthpb.RegisterHealthServer(grpcSrv, hs)
 
-	go cmd.CatchSignals(logger, grpcSrv.GracefulStop)
+	go cmd.CatchSignals(logger, func() {
+		hs.Shutdown()
+		grpcSrv.GracefulStop()
+	})
 
 	err = cmd.FilterShutdownErrors(grpcSrv.Serve(listener))
 	cmd.FailOnError(err, "SA gRPC service failed")

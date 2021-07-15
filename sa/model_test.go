@@ -1,8 +1,17 @@
 package sa
 
 import (
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/base64"
+	"math/big"
 	"testing"
+	"time"
 
+	"github.com/jmhodges/clock"
+	"github.com/letsencrypt/boulder/db"
 	"github.com/letsencrypt/boulder/grpc"
 	"github.com/letsencrypt/boulder/probs"
 
@@ -35,8 +44,8 @@ func TestModelToRegistrationBadJSON(t *testing.T) {
 		Key: badJSON,
 	})
 	test.AssertError(t, err, "expected error from truncated reg model key")
-	badJSONErr, ok := err.(errBadJSON)
-	test.AssertEquals(t, ok, true)
+	var badJSONErr errBadJSON
+	test.AssertErrorWraps(t, err, &badJSONErr)
 	test.AssertEquals(t, string(badJSONErr.json), string(badJSON))
 }
 
@@ -65,9 +74,10 @@ func TestAuthzModel(t *testing.T) {
 		Expires:        1234,
 		Challenges: []*corepb.Challenge{
 			{
-				Type:   string(core.ChallengeTypeHTTP01),
-				Status: string(core.StatusValid),
-				Token:  "MTIz",
+				Type:      string(core.ChallengeTypeHTTP01),
+				Status:    string(core.StatusValid),
+				Token:     "MTIz",
+				Validated: 1234,
 				Validationrecords: []*corepb.ValidationRecord{
 					{
 						Hostname:          "hostname",
@@ -170,8 +180,8 @@ func TestModelToChallengeBadJSON(t *testing.T) {
 		t.Run(tc.Name, func(t *testing.T) {
 			_, err := modelToChallenge(tc.Model)
 			test.AssertError(t, err, "expected error from modelToChallenge")
-			badJSONErr, ok := err.(errBadJSON)
-			test.AssertEquals(t, ok, true)
+			var badJSONErr errBadJSON
+			test.AssertErrorWraps(t, err, &badJSONErr)
 			test.AssertEquals(t, string(badJSONErr.json), string(badJSON))
 		})
 	}
@@ -185,8 +195,8 @@ func TestModelToOrderBadJSON(t *testing.T) {
 		Error: badJSON,
 	})
 	test.AssertError(t, err, "expected error from modelToOrder")
-	badJSONErr, ok := err.(errBadJSON)
-	test.AssertEquals(t, ok, true)
+	var badJSONErr errBadJSON
+	test.AssertErrorWraps(t, err, &badJSONErr)
 	test.AssertEquals(t, string(badJSONErr.json), string(badJSON))
 }
 
@@ -217,9 +227,80 @@ func TestPopulateAttemptedFieldsBadJSON(t *testing.T) {
 		t.Run(tc.Name, func(t *testing.T) {
 			err := populateAttemptedFields(*tc.Model, &corepb.Challenge{})
 			test.AssertError(t, err, "expected error from populateAttemptedFields")
-			badJSONErr, ok := err.(errBadJSON)
-			test.AssertEquals(t, ok, true)
+			var badJSONErr errBadJSON
+			test.AssertErrorWraps(t, err, &badJSONErr)
 			test.AssertEquals(t, string(badJSONErr.json), string(badJSON))
 		})
 	}
+}
+
+func TestCerficatesTableContainsDuplicateSerials(t *testing.T) {
+	sa, fc, cleanUp := initSA(t)
+	defer cleanUp()
+
+	serialString := core.SerialToString(big.NewInt(1337))
+
+	// Insert a certificate with a serial of `1337`.
+	err := insertCertificate(sa.dbMap, fc, "1337.com", "leet", 1337, 1)
+	test.AssertNotError(t, err, "couldn't insert valid certificate")
+
+	// This should return the certificate that we just inserted.
+	certA, err := SelectCertificate(sa.dbMap, serialString)
+	test.AssertNotError(t, err, "received an error for a valid query")
+
+	// Insert a certificate with a serial of `1337` but for a different
+	// hostname.
+	err = insertCertificate(sa.dbMap, fc, "1337.net", "leet", 1337, 1)
+	test.AssertNotError(t, err, "couldn't insert valid certificate")
+
+	// Despite a duplicate being present, this shouldn't error.
+	certB, err := SelectCertificate(sa.dbMap, serialString)
+	test.AssertNotError(t, err, "received an error for a valid query")
+
+	// Ensure that `certA` and `certB` are the same.
+	test.AssertByteEquals(t, certA.DER, certB.DER)
+}
+
+func insertCertificate(dbMap *db.WrappedMap, fc clock.FakeClock, hostname, cn string, serial, regID int64) error {
+	serialBigInt := big.NewInt(serial)
+	serialString := core.SerialToString(serialBigInt)
+
+	template := x509.Certificate{
+		Subject: pkix.Name{
+			CommonName: cn,
+		},
+		NotAfter:     fc.Now().Add(30 * 24 * time.Hour),
+		DNSNames:     []string{hostname},
+		SerialNumber: serialBigInt,
+	}
+
+	testKey := makeKey()
+	certDer, _ := x509.CreateCertificate(rand.Reader, &template, &template, &testKey.PublicKey, &testKey)
+	cert := &core.Certificate{
+		RegistrationID: regID,
+		Serial:         serialString,
+		Expires:        template.NotAfter,
+		DER:            certDer,
+	}
+	err := dbMap.Insert(cert)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func bigIntFromB64(b64 string) *big.Int {
+	bytes, _ := base64.URLEncoding.DecodeString(b64)
+	x := big.NewInt(0)
+	x.SetBytes(bytes)
+	return x
+}
+
+func makeKey() rsa.PrivateKey {
+	n := bigIntFromB64("n4EPtAOCc9AlkeQHPzHStgAbgs7bTZLwUBZdR8_KuKPEHLd4rHVTeT-O-XV2jRojdNhxJWTDvNd7nqQ0VEiZQHz_AJmSCpMaJMRBSFKrKb2wqVwGU_NsYOYL-QtiWN2lbzcEe6XC0dApr5ydQLrHqkHHig3RBordaZ6Aj-oBHqFEHYpPe7Tpe-OfVfHd1E6cS6M1FZcD1NNLYD5lFHpPI9bTwJlsde3uhGqC0ZCuEHg8lhzwOHrtIQbS0FVbb9k3-tVTU4fg_3L_vniUFAKwuCLqKnS2BYwdq_mzSnbLY7h_qixoR7jig3__kRhuaxwUkRz5iaiQkqgc5gHdrNP5zw==")
+	e := int(bigIntFromB64("AQAB").Int64())
+	d := bigIntFromB64("bWUC9B-EFRIo8kpGfh0ZuyGPvMNKvYWNtB_ikiH9k20eT-O1q_I78eiZkpXxXQ0UTEs2LsNRS-8uJbvQ-A1irkwMSMkK1J3XTGgdrhCku9gRldY7sNA_AKZGh-Q661_42rINLRCe8W-nZ34ui_qOfkLnK9QWDDqpaIsA-bMwWWSDFu2MUBYwkHTMEzLYGqOe04noqeq1hExBTHBOBdkMXiuFhUq1BU6l-DqEiWxqg82sXt2h-LMnT3046AOYJoRioz75tSUQfGCshWTBnP5uDjd18kKhyv07lhfSJdrPdM5Plyl21hsFf4L_mHCuoFau7gdsPfHPxxjVOcOpBrQzwQ==")
+	p := bigIntFromB64("uKE2dh-cTf6ERF4k4e_jy78GfPYUIaUyoSSJuBzp3Cubk3OCqs6grT8bR_cu0Dm1MZwWmtdqDyI95HrUeq3MP15vMMON8lHTeZu2lmKvwqW7anV5UzhM1iZ7z4yMkuUwFWoBvyY898EXvRD-hdqRxHlSqAZ192zB3pVFJ0s7pFc=")
+	q := bigIntFromB64("uKE2dh-cTf6ERF4k4e_jy78GfPYUIaUyoSSJuBzp3Cubk3OCqs6grT8bR_cu0Dm1MZwWmtdqDyI95HrUeq3MP15vMMON8lHTeZu2lmKvwqW7anV5UzhM1iZ7z4yMkuUwFWoBvyY898EXvRD-hdqRxHlSqAZ192zB3pVFJ0s7pFc=")
+	return rsa.PrivateKey{PublicKey: rsa.PublicKey{N: n, E: e}, D: d, Primes: []*big.Int{p, q}}
 }

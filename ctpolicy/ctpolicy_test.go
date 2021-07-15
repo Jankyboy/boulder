@@ -16,12 +16,13 @@ import (
 	pubpb "github.com/letsencrypt/boulder/publisher/proto"
 	"github.com/letsencrypt/boulder/test"
 	"github.com/prometheus/client_golang/prometheus"
+	"google.golang.org/grpc"
 )
 
 type mockPub struct {
 }
 
-func (mp *mockPub) SubmitToSingleCTWithResult(_ context.Context, _ *pubpb.Request) (*pubpb.Result, error) {
+func (mp *mockPub) SubmitToSingleCTWithResult(_ context.Context, _ *pubpb.Request, _ ...grpc.CallOption) (*pubpb.Result, error) {
 	return &pubpb.Result{Sct: []byte{0}}, nil
 }
 
@@ -29,7 +30,7 @@ type alwaysFail struct {
 	mockPub
 }
 
-func (mp *alwaysFail) SubmitToSingleCTWithResult(_ context.Context, _ *pubpb.Request) (*pubpb.Result, error) {
+func (mp *alwaysFail) SubmitToSingleCTWithResult(_ context.Context, _ *pubpb.Request, _ ...grpc.CallOption) (*pubpb.Result, error) {
 	return nil, errors.New("BAD")
 }
 
@@ -39,7 +40,7 @@ func TestGetSCTs(t *testing.T) {
 	missingSCTErr := berrors.MissingSCTs
 	testCases := []struct {
 		name       string
-		mock       core.Publisher
+		mock       pubpb.PublisherClient
 		groups     []ctconfig.CTGroup
 		ctx        context.Context
 		result     core.SCTDERs
@@ -126,7 +127,7 @@ func TestGetSCTs(t *testing.T) {
 					t.Errorf("Error %q did not match expected regexp %q", err, tc.errRegexp)
 				}
 				if tc.berrorType != nil {
-					test.AssertEquals(t, berrors.Is(err, *tc.berrorType), true)
+					test.AssertErrorIs(t, err, *tc.berrorType)
 				}
 			}
 		})
@@ -139,7 +140,7 @@ type failOne struct {
 	badURL string
 }
 
-func (mp *failOne) SubmitToSingleCTWithResult(_ context.Context, req *pubpb.Request) (*pubpb.Result, error) {
+func (mp *failOne) SubmitToSingleCTWithResult(_ context.Context, req *pubpb.Request, _ ...grpc.CallOption) (*pubpb.Result, error) {
 	if req.LogURL == mp.badURL {
 		return nil, errors.New("BAD")
 	}
@@ -150,7 +151,7 @@ type slowPublisher struct {
 	mockPub
 }
 
-func (sp *slowPublisher) SubmitToSingleCTWithResult(_ context.Context, req *pubpb.Request) (*pubpb.Result, error) {
+func (sp *slowPublisher) SubmitToSingleCTWithResult(_ context.Context, req *pubpb.Request, _ ...grpc.CallOption) (*pubpb.Result, error) {
 	time.Sleep(time.Second)
 	return &pubpb.Result{Sct: []byte{0}}, nil
 }
@@ -174,8 +175,8 @@ func TestGetSCTsMetrics(t *testing.T) {
 	}, nil, blog.NewMock(), metrics.NoopRegisterer)
 	_, err := ctp.GetSCTs(context.Background(), []byte{0}, time.Time{})
 	test.AssertNotError(t, err, "GetSCTs failed")
-	test.AssertEquals(t, test.CountCounter(ctp.winnerCounter.With(prometheus.Labels{"log": "ghi", "group": "a"})), 1)
-	test.AssertEquals(t, test.CountCounter(ctp.winnerCounter.With(prometheus.Labels{"log": "ghi", "group": "b"})), 1)
+	test.AssertMetricWithLabelsEquals(t, ctp.winnerCounter, prometheus.Labels{"log": "ghi", "group": "a"}, 1)
+	test.AssertMetricWithLabelsEquals(t, ctp.winnerCounter, prometheus.Labels{"log": "ghi", "group": "b"}, 1)
 }
 
 func TestGetSCTsFailMetrics(t *testing.T) {
@@ -193,7 +194,7 @@ func TestGetSCTsFailMetrics(t *testing.T) {
 	if err == nil {
 		t.Fatal("GetSCTs should have failed")
 	}
-	test.AssertEquals(t, test.CountCounter(ctp.winnerCounter.With(prometheus.Labels{"log": "all_failed", "group": "a"})), 1)
+	test.AssertMetricWithLabelsEquals(t, ctp.winnerCounter, prometheus.Labels{"log": "all_failed", "group": "a"}, 1)
 
 	// Same thing, but for when an entire log group times out.
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
@@ -211,7 +212,7 @@ func TestGetSCTsFailMetrics(t *testing.T) {
 	if err == nil {
 		t.Fatal("GetSCTs should have failed")
 	}
-	test.AssertEquals(t, test.CountCounter(ctp.winnerCounter.With(prometheus.Labels{"log": "timeout", "group": "a"})), 1)
+	test.AssertMetricWithLabelsEquals(t, ctp.winnerCounter, prometheus.Labels{"log": "timeout", "group": "a"}, 1)
 }
 
 // A mock publisher that counts submissions
@@ -219,7 +220,7 @@ type countEm struct {
 	count int
 }
 
-func (ce *countEm) SubmitToSingleCTWithResult(_ context.Context, _ *pubpb.Request) (*pubpb.Result, error) {
+func (ce *countEm) SubmitToSingleCTWithResult(_ context.Context, _ *pubpb.Request, _ ...grpc.CallOption) (*pubpb.Result, error) {
 	ce.count++
 	return &pubpb.Result{Sct: []byte{0}}, nil
 }

@@ -70,7 +70,7 @@ func TestPreresolvedDialerTimeout(t *testing.T) {
 
 	started := time.Now()
 
-	va.dnsClient = dnsMockReturnsUnroutable{&bdns.MockDNSClient{}}
+	va.dnsClient = dnsMockReturnsUnroutable{&bdns.MockClient{}}
 	// NOTE(@jsha): The only method I've found so far to trigger a connect timeout
 	// is to connect to an unrouteable IP address. This usually generates
 	// a connection timeout, but will rarely return "Network unreachable" instead.
@@ -508,7 +508,7 @@ func httpTestSrv(t *testing.T) *httptest.Server {
 	})
 
 	// A path that always redirects to itself, creating a loop that will terminate
-	// after maxRedirect.
+	// when detected.
 	mux.HandleFunc("/loop", func(resp http.ResponseWriter, req *http.Request) {
 		http.Redirect(
 			resp,
@@ -516,6 +516,23 @@ func httpTestSrv(t *testing.T) *httptest.Server {
 			fmt.Sprintf("http://example.com:%d/loop", httpPort),
 			http.StatusMovedPermanently)
 	})
+
+	// A path that sequentially redirects, creating an incrementing redirect
+	// that will terminate when the redirect limit is reached and ensures each
+	// URL is different than the last.
+	for i := 0; i <= maxRedirect+1; i++ {
+		// Need to re-scope i so it iterates properly in the function
+		i := i
+		mux.HandleFunc(fmt.Sprintf("/max-redirect/%d", i),
+			func(resp http.ResponseWriter, req *http.Request) {
+				http.Redirect(
+					resp,
+					req,
+					fmt.Sprintf("http://example.com:%d/max-redirect/%d", httpPort, i+1),
+					http.StatusMovedPermanently,
+				)
+			})
+	}
 
 	// A path that always redirects to a URL with a non-HTTP/HTTPs protocol scheme
 	mux.HandleFunc("/redir-bad-proto", func(resp http.ResponseWriter, req *http.Request) {
@@ -553,6 +570,16 @@ func httpTestSrv(t *testing.T) *httptest.Server {
 		fmt.Fprint(resp, "sorry, I'm gone")
 	})
 
+	// A path that always responds with a 303 redirect
+	mux.HandleFunc("/other", func(resp http.ResponseWriter, req *http.Request) {
+		http.Redirect(
+			resp,
+			req,
+			"http://example.org/other",
+			http.StatusSeeOther,
+		)
+	})
+
 	tooLargeBuf := bytes.NewBuffer([]byte{})
 	for i := 0; i < maxResponseSize+10; i++ {
 		tooLargeBuf.WriteByte(byte(97))
@@ -560,6 +587,20 @@ func httpTestSrv(t *testing.T) *httptest.Server {
 	mux.HandleFunc("/resp-too-big", func(resp http.ResponseWriter, req *http.Request) {
 		resp.WriteHeader(http.StatusOK)
 		fmt.Fprint(resp, tooLargeBuf)
+	})
+
+	// Create a buffer that starts with invalid UTF8 and is bigger than
+	// maxResponseSize
+	tooLargeInvalidUTF8 := bytes.NewBuffer([]byte{})
+	tooLargeInvalidUTF8.WriteString("f\xffoo")
+	tooLargeInvalidUTF8.Write(tooLargeBuf.Bytes())
+	// invalid-utf8-body Responds with body that is larger than
+	// maxResponseSize and starts with an invalid UTF8 string. This is to
+	// test the codepath where invalid UTF8 is converted to valid UTF8
+	// that can be passed as an error message via grpc.
+	mux.HandleFunc("/invalid-utf8-body", func(resp http.ResponseWriter, req *http.Request) {
+		resp.WriteHeader(http.StatusOK)
+		fmt.Fprint(resp, tooLargeInvalidUTF8)
 	})
 
 	mux.HandleFunc("/redir-path-too-long", func(resp http.ResponseWriter, req *http.Request) {
@@ -709,17 +750,41 @@ func TestFetchHTTP(t *testing.T) {
 	// We need to know the randomly assigned HTTP port for testcases as well
 	httpPort := getPort(testSrv)
 
-	// For the looped test case we expect one validation record per redirect up to
-	// maxRedirect (inclusive). There is also +1 record for the base lookup,
-	// giving a termination criteria of > maxRedirect+1
+	// For the looped test case we expect one validation record per redirect
+	// until boulder detects that a url has been used twice indicating a
+	// redirect loop. Because it is hitting the /loop endpoint it will encounter
+	// this scenario after the base url and fail on the second time hitting the
+	// redirect with a port definition. On i=0 it will encounter the first
+	// redirect to the url with a port definition and on i=1 it will encounter
+	// the second redirect to the url with the port and get an expected error.
 	expectedLoopRecords := []core.ValidationRecord{}
-	for i := 0; i <= maxRedirect+1; i++ {
+	for i := 0; i < 2; i++ {
 		// The first request will not have a port # in the URL.
 		url := "http://example.com/loop"
 		if i != 0 {
 			url = fmt.Sprintf("http://example.com:%d/loop", httpPort)
 		}
 		expectedLoopRecords = append(expectedLoopRecords,
+			core.ValidationRecord{
+				Hostname:          "example.com",
+				Port:              strconv.Itoa(httpPort),
+				URL:               url,
+				AddressesResolved: []net.IP{net.ParseIP("127.0.0.1")},
+				AddressUsed:       net.ParseIP("127.0.0.1"),
+			})
+	}
+
+	// For the too many redirect test case we expect one validation record per
+	// redirect up to maxRedirect (inclusive). There is also +1 record for the
+	// base lookup, giving a termination criteria of > maxRedirect+1
+	expectedTooManyRedirRecords := []core.ValidationRecord{}
+	for i := 0; i <= maxRedirect+1; i++ {
+		// The first request will not have a port # in the URL.
+		url := "http://example.com/max-redirect/0"
+		if i != 0 {
+			url = fmt.Sprintf("http://example.com:%d/max-redirect/%d", httpPort, i)
+		}
+		expectedTooManyRedirRecords = append(expectedTooManyRedirRecords,
 			core.ValidationRecord{
 				Hostname:          "example.com",
 				Port:              strconv.Itoa(httpPort),
@@ -774,8 +839,16 @@ func TestFetchHTTP(t *testing.T) {
 			Host: "example.com",
 			Path: "/loop",
 			ExpectedProblem: probs.ConnectionFailure(fmt.Sprintf(
-				"Fetching http://example.com:%d/loop: Too many redirects", httpPort)),
+				"Fetching http://example.com:%d/loop: Redirect loop detected", httpPort)),
 			ExpectedRecords: expectedLoopRecords,
+		},
+		{
+			Name: "Too many redirects",
+			Host: "example.com",
+			Path: "/max-redirect/0",
+			ExpectedProblem: probs.ConnectionFailure(fmt.Sprintf(
+				"Fetching http://example.com:%d/max-redirect/12: Too many redirects", httpPort)),
+			ExpectedRecords: expectedTooManyRedirRecords,
 		},
 		{
 			Name: "Redirect to bad protocol",
@@ -857,6 +930,22 @@ func TestFetchHTTP(t *testing.T) {
 					Hostname:          "example.com",
 					Port:              strconv.Itoa(httpPort),
 					URL:               "http://example.com/bad-status-code",
+					AddressesResolved: []net.IP{net.ParseIP("127.0.0.1")},
+					AddressUsed:       net.ParseIP("127.0.0.1"),
+				},
+			},
+		},
+		{
+			Name: "HTTP status code 303 redirect",
+			Host: "example.com",
+			Path: "/other",
+			ExpectedProblem: probs.ConnectionFailure(
+				"Fetching http://example.org/other: Cannot follow HTTP 303 redirects"),
+			ExpectedRecords: []core.ValidationRecord{
+				{
+					Hostname:          "example.com",
+					Port:              strconv.Itoa(httpPort),
+					URL:               "http://example.com/other",
 					AddressesResolved: []net.IP{net.ParseIP("127.0.0.1")},
 					AddressUsed:       net.ParseIP("127.0.0.1"),
 				},
@@ -998,6 +1087,23 @@ func TestFetchHTTP(t *testing.T) {
 			test.AssertMarshaledEquals(t, records, tc.ExpectedRecords)
 		})
 	}
+}
+
+func TestFetchHTTPInvalidUTF8(t *testing.T) {
+	testSrv := httpTestSrv(t)
+	defer testSrv.Close()
+	va, _ := setup(testSrv, 0, "", nil)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond*500)
+	defer cancel()
+	_, _, prob := va.fetchHTTP(ctx, "example.com", "/invalid-utf8-body")
+	expectedResult := "f\ufffdoo"
+	// If the body of the http response is larger than the maxResponseSize
+	// a truncated body is returned as part of the error detail. If the
+	// body contains invalid UTF-8 the invalid characters must be replaced
+	// before the error is marshalled for grpc. This tests that the
+	// invalid string "f\xffoo" is expected to be converted to
+	// "f\ufffdoo".
+	test.AssertContains(t, string(prob.Detail), expectedResult)
 }
 
 // All paths that get assigned to tokens MUST be valid tokens
@@ -1250,7 +1356,7 @@ func TestHTTPTimeout(t *testing.T) {
 // unroutable address for LookupHost. This is useful in testing connect
 // timeouts.
 type dnsMockReturnsUnroutable struct {
-	*bdns.MockDNSClient
+	*bdns.MockClient
 }
 
 func (mock dnsMockReturnsUnroutable) LookupHost(_ context.Context, hostname string) ([]net.IP, error) {
@@ -1268,7 +1374,7 @@ func TestHTTPDialTimeout(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
-	va.dnsClient = dnsMockReturnsUnroutable{&bdns.MockDNSClient{}}
+	va.dnsClient = dnsMockReturnsUnroutable{&bdns.MockClient{}}
 	// The only method I've found so far to trigger a connect timeout is to
 	// connect to an unrouteable IP address. This usually generates a connection
 	// timeout, but will rarely return "Network unreachable" instead. If we get

@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"regexp"
 	"strings"
@@ -57,7 +58,8 @@ func (e ErrDatabaseOp) Error() string {
 func IsNoRows(err error) bool {
 	// if the err is an ErrDatabaseOp instance, return its noRows() result to see
 	// if the inner err is sql.ErrNoRows
-	if dbErr, ok := err.(ErrDatabaseOp); ok {
+	var dbErr ErrDatabaseOp
+	if errors.As(err, &dbErr) {
 		return dbErr.noRows()
 	}
 	return false
@@ -70,7 +72,8 @@ func IsNoRows(err error) bool {
 func IsDuplicate(err error) bool {
 	// if the err is an ErrDatabaseOp instance, return its duplicate() result to
 	// see if the inner err indicates a duplicate row error.
-	if dbErr, ok := err.(ErrDatabaseOp); ok {
+	var dbErr ErrDatabaseOp
+	if errors.As(err, &dbErr) {
 		return dbErr.duplicate()
 	}
 	return false
@@ -262,7 +265,7 @@ func (we WrappedExecutor) SelectOne(holder interface{}, query string, args ...in
 
 var (
 	// selectTableRegexp matches the table name from an SQL select statement
-	selectTableRegexp = regexp.MustCompile(`(?i)^\s*select\s+[a-z\d\.\(\), \_\*` + "`" + `]+\s+from\s+([a-z\d\_,` + "`" + `]+)`)
+	selectTableRegexp = regexp.MustCompile(`(?i)^\s*select\s+[a-z\d:\.\(\), \_\*` + "`" + `]+\s+from\s+([a-z\d\_,` + "`" + `]+)`)
 	// insertTableRegexp matches the table name from an SQL insert statement
 	insertTableRegexp = regexp.MustCompile(`(?i)^\s*insert\s+into\s+([a-z\d \_,` + "`" + `]+)\s+(?:set|\()`)
 	// updateTableRegexp matches the table name from an SQL update statement

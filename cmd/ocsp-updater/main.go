@@ -2,16 +2,15 @@ package main
 
 import (
 	"context"
-	"crypto/tls"
-	"crypto/x509"
 	"database/sql"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
 	"time"
 
+	"github.com/honeycombio/beeline-go"
 	"github.com/jmhodges/clock"
-	akamaipb "github.com/letsencrypt/boulder/akamai/proto"
 	capb "github.com/letsencrypt/boulder/ca/proto"
 	"github.com/letsencrypt/boulder/cmd"
 	"github.com/letsencrypt/boulder/core"
@@ -30,7 +29,6 @@ import (
  */
 type ocspDB interface {
 	Select(i interface{}, query string, args ...interface{}) ([]interface{}, error)
-	SelectOne(holder interface{}, query string, args ...interface{}) error
 	Exec(query string, args ...interface{}) (sql.Result, error)
 }
 
@@ -57,13 +55,10 @@ type OCSPUpdater struct {
 	// these requests in parallel allows us to get higher total throughput.
 	parallelGenerateOCSPRequests int
 
-	purgerService akamaipb.AkamaiPurgerClient
-	// issuer is used to generate OCSP request URLs to purge
-	issuer *x509.Certificate
-
-	genStoreHistogram prometheus.Histogram
-	generatedCounter  *prometheus.CounterVec
-	storedCounter     *prometheus.CounterVec
+	stalenessHistogram prometheus.Histogram
+	genStoreHistogram  prometheus.Histogram
+	generatedCounter   *prometheus.CounterVec
+	storedCounter      *prometheus.CounterVec
 }
 
 func newUpdater(
@@ -71,9 +66,7 @@ func newUpdater(
 	clk clock.Clock,
 	dbMap ocspDB,
 	ogc capb.OCSPGeneratorClient,
-	apc akamaipb.AkamaiPurgerClient,
 	config OCSPUpdaterConfig,
-	issuerPath string,
 	log blog.Logger,
 ) (*OCSPUpdater, error) {
 	if config.OldOCSPBatchSize == 0 {
@@ -107,6 +100,12 @@ func newUpdater(
 		Help: "A histogram of ocsp-updater tick latencies labelled by result and whether the tick was considered longer than expected",
 	}, []string{"result", "long"})
 	stats.MustRegister(tickHistogram)
+	stalenessHistogram := prometheus.NewHistogram(prometheus.HistogramOpts{
+		Name:    "ocsp_status_staleness",
+		Help:    "How long past the refresh time a status is when we try to refresh it. Will always be > 0, but must stay well below 12 hours.",
+		Buckets: []float64{10, 100, 1000, 10000, 43200},
+	})
+	stats.MustRegister(stalenessHistogram)
 
 	updater := OCSPUpdater{
 		clk:                          clk,
@@ -115,23 +114,15 @@ func newUpdater(
 		log:                          log,
 		ocspMinTimeToExpiry:          config.OCSPMinTimeToExpiry.Duration,
 		parallelGenerateOCSPRequests: config.ParallelGenerateOCSPRequests,
-		purgerService:                apc,
 		genStoreHistogram:            genStoreHistogram,
 		generatedCounter:             generatedCounter,
 		storedCounter:                storedCounter,
+		stalenessHistogram:           stalenessHistogram,
 		tickHistogram:                tickHistogram,
 		tickWindow:                   config.OldOCSPWindow.Duration,
 		batchSize:                    config.OldOCSPBatchSize,
 		maxBackoff:                   config.SignFailureBackoffMax.Duration,
 		backoffFactor:                config.SignFailureBackoffFactor,
-	}
-
-	if updater.purgerService != nil {
-		issuer, err := core.LoadCert(issuerPath)
-		if err != nil {
-			return nil, err
-		}
-		updater.issuer = issuer
 	}
 
 	return &updater, nil
@@ -150,44 +141,28 @@ func (updater *OCSPUpdater) findStaleOCSPResponses(oldestLastUpdatedTime time.Ti
 		},
 	)
 	if db.IsNoRows(err) {
-		return statuses, nil
+		return nil, nil
 	}
+
+	for _, status := range statuses {
+		staleness := oldestLastUpdatedTime.Sub(status.OCSPLastUpdated).Seconds()
+		updater.stalenessHistogram.Observe(staleness)
+	}
+
 	return statuses, err
 }
 
-func getCertDER(selector ocspDB, serial string) ([]byte, error) {
-	cert, err := sa.SelectCertificate(selector, serial)
-	if err != nil {
-		if db.IsNoRows(err) {
-			cert, err = sa.SelectPrecertificate(selector, serial)
-			// If there was still a non-nil error return it. If we can't find
-			// a precert row something is amiss, we have a certificateStatus row with
-			// no matching certificate or precertificate.
-			if err != nil {
-				return nil, err
-			}
-		} else {
-			return nil, err
-		}
-	}
-	return cert.DER, nil
-}
-
 func (updater *OCSPUpdater) generateResponse(ctx context.Context, status core.CertificateStatus) (*core.CertificateStatus, error) {
-	ocspReq := capb.GenerateOCSPRequest{
-		Reason:    int32(status.RevokedReason),
-		Status:    string(status.Status),
-		RevokedAt: status.RevokedDate.UnixNano(),
+	// TODO(#5152): Replace IssuerID with IssuerNameID.
+	if status.IssuerID == nil || *status.IssuerID == 0 {
+		return nil, errors.New("cert status has nil or 0 IssuerID")
 	}
-	if status.IssuerID != nil && *status.IssuerID != 0 {
-		ocspReq.Serial = status.Serial
-		ocspReq.IssuerID = *status.IssuerID
-	} else {
-		certDER, err := getCertDER(updater.dbMap, status.Serial)
-		if err != nil {
-			return nil, err
-		}
-		ocspReq.CertDER = certDER
+	ocspReq := capb.GenerateOCSPRequest{
+		Serial:    status.Serial,
+		IssuerID:  *status.IssuerID,
+		Status:    string(status.Status),
+		Reason:    int32(status.RevokedReason),
+		RevokedAt: status.RevokedDate.UnixNano(),
 	}
 
 	ocspResponse, err := updater.ogc.GenerateOCSP(ctx, &ocspReq)
@@ -299,18 +274,15 @@ func (updater *OCSPUpdater) updateOCSPResponses(ctx context.Context, batchSize i
 type config struct {
 	OCSPUpdater OCSPUpdaterConfig
 
-	Syslog cmd.SyslogConfig
-
-	Common struct {
-		IssuerCert string
-	}
+	Syslog  cmd.SyslogConfig
+	Beeline cmd.BeelineConfig
 }
 
 // OCSPUpdaterConfig provides the various window tick times and batch sizes needed
 // for the OCSP (and SCT) updater
 type OCSPUpdaterConfig struct {
 	cmd.ServiceConfig
-	cmd.DBConfig
+	DB cmd.DBConfig
 
 	OldOCSPWindow    cmd.ConfigDuration
 	OldOCSPBatchSize int
@@ -318,47 +290,12 @@ type OCSPUpdaterConfig struct {
 	OCSPMinTimeToExpiry          cmd.ConfigDuration
 	ParallelGenerateOCSPRequests int
 
-	AkamaiBaseURL           string
-	AkamaiClientToken       string
-	AkamaiClientSecret      string
-	AkamaiAccessToken       string
-	AkamaiV3Network         string
-	AkamaiPurgeRetries      int
-	AkamaiPurgeRetryBackoff cmd.ConfigDuration
-
 	SignFailureBackoffFactor float64
 	SignFailureBackoffMax    cmd.ConfigDuration
 
-	SAService            *cmd.GRPCClientConfig
 	OCSPGeneratorService *cmd.GRPCClientConfig
-	AkamaiPurgerService  *cmd.GRPCClientConfig
 
 	Features map[string]bool
-}
-
-func setupClients(c OCSPUpdaterConfig, stats prometheus.Registerer, clk clock.Clock) (
-	capb.OCSPGeneratorClient,
-	akamaipb.AkamaiPurgerClient,
-) {
-	var tls *tls.Config
-	var err error
-	if c.TLS.CertFile != nil {
-		tls, err = c.TLS.Load()
-		cmd.FailOnError(err, "TLS config")
-	}
-	clientMetrics := bgrpc.NewClientMetrics(stats)
-	caConn, err := bgrpc.ClientSetup(c.OCSPGeneratorService, tls, clientMetrics, clk)
-	cmd.FailOnError(err, "Failed to load credentials and create gRPC connection to CA")
-	ogc := bgrpc.NewOCSPGeneratorClient(capb.NewOCSPGeneratorClient(caConn))
-
-	var apc akamaipb.AkamaiPurgerClient
-	if c.AkamaiPurgerService != nil {
-		apcConn, err := bgrpc.ClientSetup(c.AkamaiPurgerService, tls, clientMetrics, clk)
-		cmd.FailOnError(err, "Failed to load credentials and create gRPC connection to Akamai Purger service")
-		apc = akamaipb.NewAkamaiPurgerClient(apcConn)
-	}
-
-	return ogc, apc
 }
 
 func (updater *OCSPUpdater) tick() {
@@ -403,31 +340,46 @@ func main() {
 	err = features.Set(conf.Features)
 	cmd.FailOnError(err, "Failed to set feature flags")
 
+	bc, err := c.Beeline.Load()
+	cmd.FailOnError(err, "Failed to load Beeline config")
+	beeline.Init(bc)
+	defer beeline.Close()
+
 	stats, logger := cmd.StatsAndLogging(c.Syslog, conf.DebugAddr)
 	defer logger.AuditPanic()
 	logger.Info(cmd.VersionString())
 
 	// Configure DB
-	dbURL, err := conf.DBConfig.URL()
+	dbURL, err := conf.DB.URL()
 	cmd.FailOnError(err, "Couldn't load DB URL")
-	dbMap, err := sa.NewDbMap(dbURL, conf.DBConfig.MaxDBConns)
+	dbSettings := sa.DbSettings{
+		MaxOpenConns:    conf.DB.MaxOpenConns,
+		MaxIdleConns:    conf.DB.MaxIdleConns,
+		ConnMaxLifetime: conf.DB.ConnMaxLifetime.Duration,
+		ConnMaxIdleTime: conf.DB.ConnMaxIdleTime.Duration}
+
+	dbMap, err := sa.NewDbMap(dbURL, dbSettings)
 	cmd.FailOnError(err, "Could not connect to database")
 
 	// Collect and periodically report DB metrics using the DBMap and prometheus stats.
-	sa.InitDBMetrics(dbMap, stats)
+	sa.InitDBMetrics(dbMap, stats, dbSettings)
 
 	clk := cmd.Clock()
-	ogc, apc := setupClients(conf, stats, clk)
+
+	tlsConfig, err := c.OCSPUpdater.TLS.Load()
+	cmd.FailOnError(err, "TLS config")
+	clientMetrics := bgrpc.NewClientMetrics(stats)
+	caConn, err := bgrpc.ClientSetup(c.OCSPUpdater.OCSPGeneratorService, tlsConfig, clientMetrics, clk)
+	cmd.FailOnError(err, "Failed to load credentials and create gRPC connection to CA")
+	ogc := capb.NewOCSPGeneratorClient(caConn)
 
 	updater, err := newUpdater(
 		stats,
 		clk,
 		dbMap,
 		ogc,
-		apc,
 		// Necessary evil for now
 		conf,
-		c.Common.IssuerCert,
 		logger,
 	)
 	cmd.FailOnError(err, "Failed to create updater")

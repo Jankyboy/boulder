@@ -8,7 +8,6 @@ and test cases that have to run at a specific point in the cycle (e.g. after all
 other test cases) are also in this file.
 """
 import argparse
-import atexit
 import datetime
 import inspect
 import json
@@ -59,7 +58,7 @@ def run_expired_authz_purger():
         tool = "expired-authz-purger2"
         out = get_future_output([
             "./bin/expired-authz-purger2", "--single-run",
-            "--config", "cmd/expired-authz-purger2/config.json"], target_time)
+            "--config", "%s/expired-authz-purger2.json" % (config_dir)], target_time)
         if 'via FAKECLOCK' not in out:
             raise(Exception("%s was not built with `integration` build tag" % (tool)))
         if num is None:
@@ -387,10 +386,3 @@ def run_cert_checker():
 
 if __name__ == "__main__":
     main()
-
-@atexit.register
-def stop():
-    if exit_status == 0:
-        print("\n\nSUCCESS")
-    else:
-        print("\n\nFAILURE")
